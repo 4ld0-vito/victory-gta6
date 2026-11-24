@@ -1766,6 +1766,86 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// A host buffer placed over `len` bytes of a committed section from
+    /// byte `offset` on (title memory in physical pages): the GPU reads and
+    /// writes the title's own pages. Returns the buffer and the host GPU
+    /// address of `offset`. Heaps are opened once per section
+    /// (`OpenExistingHeapFromFileMapping`: committed sections below 4 GiB;
+    /// the heap is shared across adapters, so its buffers say so too).
+    pub(crate) fn section_buffer(
+        &self,
+        handle: usize,
+        section: u64,
+        offset: u64,
+        len: u64,
+    ) -> Option<(ID3D12Resource, u64)> {
+        use std::collections::HashMap;
+        static HEAPS: Mutex<Option<HashMap<u64, Option<(ID3D12Heap, u64)>>>> = Mutex::new(None);
+        let (heap, size) = {
+            let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = heaps.get_or_insert_with(HashMap::new);
+            heaps
+                .entry(section)
+                .or_insert_with(|| {
+                    let device: ID3D12Device3 = self.device.cast().ok()?;
+                    // SAFETY: a live section handle the runtime owns.
+                    let opened: windows::core::Result<ID3D12Heap> = unsafe {
+                        device.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut std::ffi::c_void))
+                    };
+                    match opened {
+                        Ok(heap) => {
+                            // SAFETY: a live heap.
+                            let size = unsafe { heap.GetDesc() }.SizeInBytes;
+                            tracing::info!(section, size, "physical pages opened as a host heap");
+                            Some((heap, size))
+                        }
+                        Err(r) => {
+                            tracing::warn!(section, %r, "physical pages could not be opened as a host heap");
+                            None
+                        }
+                    }
+                })
+                .clone()?
+        };
+        const ALIGN: u64 = 64 << 10;
+        let aligned = offset & !(ALIGN - 1);
+        let width = (offset + len.max(1) - aligned).next_multiple_of(ALIGN).min(size - aligned);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: a placed buffer inside the heap.
+        let placed = unsafe {
+            self.device.CreatePlacedResource(
+                &heap,
+                aligned,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        if let Err(error) = placed {
+            tracing::warn!(section, offset, len, %error, "no buffer placed over physical pages");
+            return None;
+        }
+        let buffer = buffer?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - aligned);
+        Some((buffer, gpu))
+    }
+
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,

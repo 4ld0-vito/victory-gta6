@@ -342,7 +342,11 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section handle, whether it is committed whole, and a number no other
+/// section gets (handles are reused once closed).
+struct Section(HANDLE, bool, u64);
+
+static SECTION_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -395,54 +399,107 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    let Some(_size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    // Pagefile-backed sections of at most `SECTION_MAX` bytes, committed
+    // whole: the GPU side opens each as a D3D12 heap
+    // (`OpenExistingHeapFromFileMapping` takes committed sections of up to
+    // 4 GiB, not reserved ones) and places title buffers in it, so shaders
+    // read and write the title's own pages instead of copies of them.
+    // `VICTORY_SECTIONS=reserve` keeps the old reserved section (committed
+    // when first mapped or written), for hosts short of commit: Grand Theft
+    // Auto VI asks for 6.1 GiB at once (error 1450 on a busy host).
+    let reserve = std::env::var("VICTORY_SECTIONS").as_deref() == Ok("reserve");
+    let per = if reserve { n } else { (SECTION_MAX / PAGE).max(1) };
+    let mut sections = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let take = left.min(per);
+        let bytes = take * PAGE;
+        let commit = !reserve || on_wine();
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if commit { SEC_COMMIT } else { SEC_RESERVE },
+                (bytes as u64 >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            drop(sections);
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        let id = SECTION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sections.push((Arc::new(Section(handle, commit, id)), take));
+        left -= take;
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut done = 0;
+    for (section, take) in sections {
+        for index in 0..take {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + (done + index) * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(done + index).write(number) };
+        }
+        done += take;
     }
     1
+}
+
+/// The largest section physical pages come in (a D3D12 heap opened from a
+/// section must stay below 4 GiB).
+const SECTION_MAX: usize = 2 << 30;
+
+/// The committed section and byte offset in it behind `[address, address +
+/// len)` of title memory, when the whole range shows consecutive bytes of
+/// one committed section (views of runs of its pages, back to back); the
+/// GPU side places buffers there (`victory_gpu::resource::use_section_lookup`).
+pub fn section_at(address: u64, len: u64) -> Option<(usize, u64, u64)> {
+    let (address, len) = (address as usize, len.max(1) as usize);
+    let end = address.checked_add(len)?;
+    let physical = physical();
+    let (&base, (size, slice)) = physical.views.range(..=address).next_back()?;
+    if address >= base + size || !slice.section.1 {
+        return None;
+    }
+    let section = slice.section.clone();
+    let offset = slice.index * PAGE + (address - base);
+    // Following views must continue the same section where the last ended.
+    let (mut at, mut next_index) = (base + size, slice.index + size / PAGE);
+    while at < end {
+        let (&b, (n, s)) = physical.views.range(at..).next()?;
+        if b != at || !Arc::ptr_eq(&s.section, &section) || s.index != next_index {
+            return None;
+        }
+        at = b + n;
+        next_index = s.index + n / PAGE;
+    }
+    Some((section.0 as usize, section.2, offset as u64))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

@@ -591,6 +591,25 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// The committed section behind a range of title memory, when the whole
+/// range shows consecutive bytes of one: `(section handle, section number,
+/// byte offset)`. Section numbers are never reused (handles are).
+pub type SectionLookup = fn(u64, u64) -> Option<(usize, u64, u64)>;
+static SECTION_LOOKUP: std::sync::OnceLock<SectionLookup> = std::sync::OnceLock::new();
+
+/// The runtime's section lookup: title buffers in physical pages become
+/// host buffers placed over those very pages (no copies; `crate::shadow`).
+pub fn use_section_lookup(lookup: SectionLookup) {
+    let _ = SECTION_LOOKUP.set(lookup);
+}
+
+pub(crate) fn section_lookup() -> Option<SectionLookup> {
+    if std::env::var_os("VICTORY_NO_DIRECT").is_some() {
+        return None;
+    }
+    SECTION_LOOKUP.get().copied()
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only

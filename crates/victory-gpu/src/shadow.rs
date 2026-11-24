@@ -43,6 +43,9 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The host buffer lies over the title's own pages (a committed section
+    /// opened as a heap): nothing is copied either way.
+    direct: bool,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -107,6 +110,10 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        Shadow::make(buffer, data, gpu, start, len, false)
+    }
+
+    fn make(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, direct: bool) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
@@ -118,6 +125,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            direct,
         }
     }
 
@@ -149,6 +157,9 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.direct {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,6 +199,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -263,6 +277,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -409,30 +426,92 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+    if let Some(shadow) = &entry.shadow {
+        return Some(shadow.clone());
+    }
+    let len = entry.end - key.0;
+    // Made without the lock: the section lookup takes the runtime's page
+    // lock, which is held while it reports remapped pages to `remapped`.
+    drop(map);
+    let shadow = make(key.0, len, "title buffer")?;
+    let mut map = buffers();
+    let entry = map.get_mut(&key)?;
+    Some(entry.shadow.get_or_insert(shadow).clone())
+}
+
+/// Counts of copies made and of buffers placed over title pages, for the log.
+static MADE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A host buffer for `[start, start + len)` of title memory: placed over the
+/// title's own pages when they are one committed section's, else a copy.
+fn make(start: u64, len: u64, what: &str) -> Option<Arc<Shadow>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let host = host()?;
+    if let Some(lookup) = crate::resource::section_lookup()
+        && let Some((handle, section, offset)) = lookup(start, len)
+        && let Some((buffer, gpu)) = host.section_buffer(handle, section, offset, len)
+    {
+        crate::host::name(&buffer, || format!("{what} {start:#x}+{len:#x} (title pages)"));
+        let n = MADE[0].fetch_add(1, Relaxed) + 1;
+        let bytes = MADE[1].fetch_add(len, Relaxed) + len;
+        if n.is_power_of_two() {
             tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
+                buffers = n,
+                mb = bytes >> 20,
+                copies = MADE[2].load(Relaxed),
+                copied_mb = MADE[3].load(Relaxed) >> 20,
+                "title buffers placed over their own pages (no copies)"
             );
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        return Some(Arc::new(Shadow::make(buffer, start as *mut u8, gpu, start, len, true)));
     }
-    entry.shadow.clone()
+    MADE[2].fetch_add(1, Relaxed);
+    MADE[3].fetch_add(len, Relaxed);
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let (buffer, data) = host.shared_buffer(len.next_multiple_of(1 << 16))?;
+    crate::host::name(&buffer, || format!("{what} {start:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if std::env::var_os("VICTORY_COPY_WHERE").is_some() {
+        // Diagnostics: what memory copied buffers lie in.
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space.
+        unsafe { VirtualQuery(start as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            base = format_args!("{:p}", info.AllocationBase),
+            region = info.RegionSize,
+            state = format_args!("{:#x}", info.State),
+            kind = format_args!("{:#x}", info.Type),
+            "copied buffer memory"
+        );
+    }
+    if len >= 16 << 20 {
+        tracing::info!(start = format_args!("{start:#x}"), len, "large buffer copied to the host");
+    } else {
+        tracing::debug!(start = format_args!("{start:#x}"), len, "buffer copied to the host");
+    }
+    Some(Arc::new(Shadow::new(buffer, data, gpu, start, len)))
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: buffers
+/// placed over the pages that showed there no longer show the title's
+/// memory, so they are made again on next use (lists that hold them keep
+/// them alive until reset).
+pub(crate) fn remapped(at: usize, len: usize) {
+    let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
+    for entry in buffers().iter_mut().filter(|((start, _), e)| *start < end && e.end > at).map(|(_, e)| e) {
+        if entry.shadow.as_ref().is_some_and(|s| s.direct) {
+            entry.shadow = None;
+        }
+    }
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&(start, n), s| !(s.direct && start < end && start + n > at));
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -448,22 +527,14 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    drop(map);
+    let shadow = make(start, len, "title memory")?;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    Some(map.entry((start, len)).or_insert(shadow).clone())
 }
 
 /// For device-removed reports: the copy of title memory whose host range
