@@ -1312,8 +1312,11 @@ impl State {
             passes: u64,
             ranges: Ranges,
             by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            refcounts: std::collections::HashMap<usize, u32>,
             spans: std::sync::Arc<SpansVec>,
             spans_dirty: bool,
+            needs_shrink: bool,
+            last_rebuild_frame: u64,
             all_slots: Vec<u32>,
             sweep_cursor: usize,
         }
@@ -1323,8 +1326,11 @@ impl State {
                     passes: 0,
                     ranges: Ranges::new(),
                     by_copy: std::collections::HashMap::new(),
+                    refcounts: std::collections::HashMap::new(),
                     spans: std::sync::Arc::new(Vec::new()),
                     spans_dirty: false,
+                    needs_shrink: false,
+                    last_rebuild_frame: 0,
                     all_slots: Vec::new(),
                     sweep_cursor: 0,
                 }
@@ -1360,32 +1366,39 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        let mut full_rebuild = false;
-        let check_shrink = |by_copy: &std::collections::HashMap<
-            usize,
-            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
-        >,
-                            old: &(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
-                            full_rebuild: &mut bool| {
-            if *full_rebuild {
-                return;
-            }
-            let key = std::sync::Arc::as_ptr(&old.0) as usize;
-            if by_copy.get(&key).is_none_or(|(_, min, max)| old.1 <= *min || old.2 >= *max) {
-                *full_rebuild = true;
+        let release_old = |cache: &mut HeapCache, old: &(std::sync::Arc<crate::shadow::Shadow>, u64, u64)| {
+            let old_key = std::sync::Arc::as_ptr(&old.0) as usize;
+            let remove_copy = match cache.refcounts.get_mut(&old_key) {
+                Some(rc) if *rc > 1 => {
+                    *rc -= 1;
+                    false
+                }
+                _ => {
+                    cache.refcounts.remove(&old_key);
+                    true
+                }
+            };
+            if remove_copy {
+                if cache.by_copy.remove(&old_key).is_some() {
+                    cache.spans_dirty = true;
+                }
+            } else if !cache.needs_shrink
+                && cache.by_copy.get(&old_key).is_none_or(|(_, min, max)| old.1 <= *min || old.2 >= *max)
+            {
+                cache.needs_shrink = true;
             }
         };
         for (n, &index) in slots.iter().enumerate() {
             let old = cache.ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 if let Some(old) = old {
-                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                    release_old(cache, &old);
                 }
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
                 if let Some(old) = old {
-                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                    release_old(cache, &old);
                 }
                 continue;
             };
@@ -1408,7 +1421,7 @@ impl State {
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 if let Some(old) = old {
-                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                    release_old(cache, &old);
                 }
                 continue;
             };
@@ -1422,12 +1435,10 @@ impl State {
             });
             if !same {
                 if let Some(old) = old {
-                    let same_shadow = std::sync::Arc::ptr_eq(&old.0, &shadow);
-                    if !same_shadow || address > old.1 || new_end < old.2 {
-                        check_shrink(&cache.by_copy, &old, &mut full_rebuild);
-                    }
+                    release_old(cache, &old);
                 }
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                *cache.refcounts.entry(key).or_insert(0) += 1;
                 match cache.by_copy.get_mut(&key) {
                     Some(span) => {
                         if address < span.1 {
@@ -1448,16 +1459,22 @@ impl State {
             cache.ranges.insert(index, (shadow, address, new_end));
         }
         let views = cache.ranges.len() as u32;
-        if full_rebuild || (cache.spans.is_empty() && !cache.ranges.is_empty()) {
+        if (cache.spans.is_empty() && !cache.ranges.is_empty())
+            || (cache.needs_shrink && frame >= cache.last_rebuild_frame + 64)
+        {
             cache.by_copy.clear();
+            cache.refcounts.clear();
             for (shadow, from, to) in cache.ranges.values() {
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
+                *cache.refcounts.entry(key).or_insert(0) += 1;
                 let span = cache.by_copy.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
                 span.1 = span.1.min(*from);
                 span.2 = span.2.max(*to);
             }
             cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
             cache.spans_dirty = false;
+            cache.needs_shrink = false;
+            cache.last_rebuild_frame = frame;
         } else if cache.spans_dirty {
             cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
             cache.spans_dirty = false;
@@ -1570,7 +1587,7 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, 512);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);

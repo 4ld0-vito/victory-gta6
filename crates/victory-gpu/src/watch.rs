@@ -20,7 +20,7 @@
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -445,6 +445,13 @@ impl BlockRuns {
             .is_some_and(|(_, &end)| *block < end)
     }
 
+    fn run_end(&self, block: usize) -> Option<usize> {
+        self.0
+            .range(..=block)
+            .next_back()
+            .and_then(|(_, &end)| (block < end).then_some(end))
+    }
+
     fn contains_range(&self, first: usize, last: usize) -> bool {
         first >= last
             || self
@@ -563,14 +570,41 @@ struct Guards {
     clean: BlockRuns,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    absent: BlockRuns,
+    /// Absent blocks already re-checked in `absent_frame` (`frame > 0`).
+    absent_checked: BlockRuns,
+    absent_frame: u64,
+    /// Per-frame fault counts and hot blocks kept writable for `hot_frame`.
+    hot_frame: u64,
+    fault_counts: BTreeMap<usize, u8>,
+    hot: BlockRuns,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BlockRuns::new(),
     clean: BlockRuns::new(),
-    absent: BTreeSet::new(),
+    absent: BlockRuns::new(),
+    absent_checked: BlockRuns::new(),
+    absent_frame: 0,
+    hot_frame: 0,
+    fault_counts: BTreeMap::new(),
+    hot: BlockRuns::new(),
 });
+
+/// Whether blocks faulted multiple times within a single frame remain writable
+/// for the rest of that frame (`VICTORY_GUARD_HOT=1` turns it on; off by default).
+fn guard_hot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOT").is_some_and(|v| v == "1"))
+}
+
+fn reset_hot_if_new_frame(g: &mut Guards, frame: u64) {
+    if frame != g.hot_frame {
+        g.hot_frame = frame;
+        g.fault_counts.clear();
+        g.hot = BlockRuns::new();
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -589,6 +623,10 @@ fn guard_is_clean(start: usize, end: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_with_hot(start, end, guard_hot_enabled())
+}
+
+fn guard_with_hot(start: usize, end: usize, hot_on: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -613,7 +651,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    let frame = crate::frame::current();
+    let cache_absent = !cfg!(test) && frame > 0;
     let mut g = guards();
+    if hot_on {
+        reset_hot_if_new_frame(&mut g, frame);
+    }
+    if cache_absent && frame != g.absent_frame {
+        g.absent_frame = frame;
+        g.absent_checked = BlockRuns::new();
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     if first < last && g.clean.contains_range(first, last) {
@@ -622,32 +669,53 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut uncommitted_until = first;
     for (m_from, m_to) in g.clean.missing_ranges(first, last) {
-        for block in m_from..=m_to {
-            let mut open = block < m_to;
-            if open && g.absent.contains(&block) {
+        let mut block = m_from;
+        while block < m_to {
+            if let Some(abs_end) = g.absent.run_end(block) {
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block);
+                }
+                if cache_absent
+                    && let Some(checked_end) = g.absent_checked.run_end(block)
+                {
+                    block = abs_end.min(checked_end).min(m_to);
+                    continue;
+                }
                 // Ordinary commits need no runtime mapping notification. Reuse
                 // this asking's query for the following blocks in the same region.
                 if block >= uncommitted_until {
                     uncommitted_until = uncommitted_end(block);
                 }
-                open = block >= uncommitted_until;
-                if open {
-                    g.absent.remove(&block);
-                }
-            }
-            if open {
-                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                if g.protected.contains(&block) {
-                    // Written through the runtime, still read-only.
-                    g.clean.insert(block);
-                } else {
-                    run.get_or_insert(block);
+                if block < uncommitted_until {
+                    let skip_to = uncommitted_until.min(abs_end).min(m_to);
+                    if cache_absent {
+                        g.absent_checked.insert_range(block, skip_to);
+                    }
+                    block = skip_to;
                     continue;
                 }
+                g.absent.remove_range(block, block + 1);
+                g.absent_checked.remove_range(block, block + 1);
             }
-            if let Some(from) = run.take() {
-                protect(&mut g, from, block);
+            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            if g.protected.contains(&block) {
+                // Written through the runtime, still read-only.
+                g.clean.insert(block);
+                block += 1;
+                continue;
             }
+            if hot_on && g.hot.contains(&block) {
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block);
+                }
+                block += 1;
+                continue;
+            }
+            run.get_or_insert(block);
+            block += 1;
+        }
+        if let Some(from) = run.take() {
+            protect(&mut g, from, m_to);
         }
     }
     Some(written)
@@ -701,7 +769,10 @@ fn is_view(start: usize, end: usize) -> bool {
 /// block by block if they span views, leaving out any that fail, and
 /// noting those not committed (unmapped) absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY,
+        VirtualProtect, VirtualQuery,
+    };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -722,12 +793,35 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         note(g, from, to);
         return;
     }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+    let mut cur = from;
+    while cur < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((cur * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            cur += 1;
+            continue;
         }
+        let raw_end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+        let reg_end = raw_end.clamp(cur + 1, to);
+        if matches!(info.State, MEM_RESERVE | MEM_FREE) {
+            // Only wholly uncommitted blocks belong in `absent`.
+            if raw_end > cur {
+                g.absent.insert_range(cur, reg_end);
+            }
+        } else if info.State == MEM_COMMIT {
+            if raw_end > cur && set(cur, reg_end) {
+                note(g, cur, reg_end);
+            } else if raw_end > cur {
+                for block in cur..reg_end {
+                    if set(block, block + 1) {
+                        note(g, block, block + 1);
+                    }
+                }
+            }
+        }
+        cur = reg_end;
     }
 }
 
@@ -853,10 +947,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
-    for block in absent {
-        g.absent.remove(&block);
-    }
+    g.absent.remove_range(range.start, range.end);
+    g.absent_checked.remove_range(range.start, range.end);
     g.protected.remove_range(range.start, range.end);
     g.clean.remove_range(range.start, range.end);
 }
@@ -1038,6 +1130,14 @@ fn install() {
             // (then it is ours again, not read-only for some other reason).
             let mut g = guards();
             if open(&mut g, at, at + 1) {
+                if guard_hot_enabled() || cfg!(test) {
+                    reset_hot_if_new_frame(&mut g, crate::frame::current());
+                    let count = g.fault_counts.entry(at / BLOCK).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if *count >= 2 {
+                        g.hot.insert(at / BLOCK);
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -1419,6 +1519,76 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn coalesced_protect_and_hot_block_hysteresis() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+
+        const SIZE: usize = 3 * BLOCK;
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                title_memory_remapped(self.0.Value as usize, SIZE);
+                // SAFETY: our view is still mapped.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: reserved section of 3 blocks; block 0 & 2 committed, block 1 uncommitted.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            View(view)
+        };
+        let start = view.0.Value as usize;
+        // SAFETY: committing blocks 0 and 2 of our reserved view.
+        unsafe {
+            assert_eq!(VirtualAlloc(start as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) as usize, start);
+            assert_eq!(
+                VirtualAlloc((start + 2 * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) as usize,
+                start + 2 * BLOCK
+            );
+        }
+        let b0 = start / BLOCK;
+        let _ = guard(start, start + SIZE).unwrap();
+        {
+            let g = guards();
+            assert!(g.protected.contains(&b0));
+            assert!(g.absent.contains_range(b0 + 1, b0 + 2));
+            assert!(g.protected.contains(&(b0 + 2)));
+        }
+
+        // Trigger two write faults on block 0 within the same frame -> marked hot.
+        // SAFETY: `start` is committed and guarded read-only.
+        unsafe { (start as *mut u8).write_volatile(0x11) };
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
+        assert!(!writable(start), "first write fault should re-protect block");
+
+        // Second fault in same frame leaves block writable when hot-block hysteresis is active.
+        unsafe { (start as *mut u8).write_volatile(0x22) };
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
+        assert!(writable(start), "second fault in same frame keeps hot block writable");
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
+        assert!(writable(start));
+
+        // Advancing frame resets hot state so next guard() re-protects block 0.
+        reset_hot_if_new_frame(&mut guards(), crate::frame::current().wrapping_add(1));
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
+        assert!(!writable(start), "advancing frame re-arms guard on previously hot block");
     }
 }
 
