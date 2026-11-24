@@ -864,7 +864,9 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
-const NOT_WATCHED: u8 = 2;
+const WATCHED_KERNEL: u8 = 1;
+const WATCHED_GUARD: u8 = 2;
+const NOT_WATCHED: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1678,6 +1680,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the memory behind the copy is view memory tracked by guards.
+    pub(crate) fn is_guarded(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == WATCHED_GUARD
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2404,9 +2411,13 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        let w = self.watched.load(Ordering::Relaxed);
+        if w != NOT_WATCHED {
+            if let Some((now, written, guarded)) = crate::watch::writes_ex(from, to, true, w == WATCHED_GUARD) {
+                self.watched.store(
+                    if guarded { WATCHED_GUARD } else { WATCHED_KERNEL },
+                    Ordering::Relaxed,
+                );
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {

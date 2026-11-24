@@ -21,7 +21,8 @@
 //! (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -48,7 +49,7 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
+static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
@@ -56,6 +57,9 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// Lock-free mirror of `Journal::kept` so `wrote()` skips locking when inactive.
+static JOURNAL_KEPT: AtomicBool = AtomicBool::new(false);
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -81,7 +85,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -135,7 +139,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if !j.kept {
         j.ahead.clear();
     }
@@ -174,7 +178,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -196,15 +200,20 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.kept = !j.ahead.is_empty();
+    JOURNAL_KEPT.store(j.kept, Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !JOURNAL_KEPT.load(Ordering::Acquire) {
+        return;
+    }
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        JOURNAL_KEPT.store(false, Ordering::Release);
     }
 }
 
@@ -212,8 +221,11 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if len == 0 || !JOURNAL_KEPT.load(Ordering::Acquire) {
+        return;
+    }
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
         return;
     }
     j.asked += 1;
@@ -288,7 +300,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -301,19 +313,68 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_ex(start, end, guarded, false).map(|(now, pages, _)| (now, pages))
+}
+
+/// Like [`writes`], additionally skipping `GetWriteWatch` when `known_guard`
+/// is true and reporting whether the range is tracked by page guards.
+pub(crate) fn writes_ex(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    known_guard: bool,
+) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !known_guard {
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((
+                j.ahead_asked,
+                j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+                false,
+            ));
+        }
+    }
+    if known_guard && guarded {
+        let (a, b) = (first * PAGE, last * PAGE);
+        if guard_is_clean(a, b) {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            if j.asked > 0 {
+                return Some((
+                    j.asked,
+                    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+                    true,
+                ));
+            }
+        }
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let written = guard(a, b);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        let guarded_pages = written?;
+        j.asked += 1;
+        let now = j.asked;
+        for page in guarded_pages {
+            j.written.insert(page, now);
+        }
+        return Some((
+            now,
+            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            true,
+        ));
+    }
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
+            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+            false,
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -361,34 +422,139 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     Some((
         now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
+        j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+        failed,
     ))
 }
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Disjoint, non-adjacent half-open block intervals `[start, end)`.
+struct BlockRuns(BTreeMap<usize, usize>);
+
+impl BlockRuns {
+    const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    fn contains(&self, block: &usize) -> bool {
+        self.0
+            .range(..=*block)
+            .next_back()
+            .is_some_and(|(_, &end)| *block < end)
+    }
+
+    fn contains_range(&self, first: usize, last: usize) -> bool {
+        first >= last
+            || self
+                .0
+                .range(..=first)
+                .next_back()
+                .is_some_and(|(_, &end)| end >= last)
+    }
+
+    fn any_overlapping(&self, first: usize, last: usize) -> bool {
+        first < last
+            && self
+                .0
+                .range(..last)
+                .next_back()
+                .is_some_and(|(_, &end)| end > first)
+    }
+
+    fn overlapping_ranges(&self, first: usize, last: usize) -> Vec<(usize, usize)> {
+        if !self.any_overlapping(first, last) {
+            return Vec::new();
+        }
+        let cursor = self
+            .0
+            .range(..=first)
+            .next_back()
+            .map_or(first, |(&s, &e)| if e > first { s } else { first });
+        self.0
+            .range(cursor..last)
+            .filter_map(|(&s, &e)| {
+                let a = s.max(first);
+                let b = e.min(last);
+                (a < b).then_some((a, b))
+            })
+            .collect()
+    }
+
+    fn insert(&mut self, block: usize) {
+        self.insert_range(block, block + 1);
+    }
+
+    fn insert_range(&mut self, mut from: usize, mut to: usize) {
+        if from >= to {
+            return;
+        }
+        if let Some((&s, &e)) = self.0.range(..=from).next_back()
+            && e >= from
+        {
+            from = s;
+            to = to.max(e);
+            self.0.remove(&s);
+        }
+        while let Some((&s, &e)) = self.0.range(from..=to).next() {
+            to = to.max(e);
+            self.0.remove(&s);
+        }
+        self.0.insert(from, to);
+    }
+
+    fn remove_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        if let Some((&s, &e)) = self.0.range(..from).next_back()
+            && e > from
+        {
+            self.0.insert(s, from);
+            if e > to {
+                self.0.insert(to, e);
+                return;
+            }
+        }
+        let keys: Vec<usize> = self.0.range(from..to).map(|(&k, _)| k).collect();
+        for k in keys {
+            if let Some(e) = self.0.remove(&k)
+                && e > to
+            {
+                self.0.insert(to, e);
+            }
+        }
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: BlockRuns,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: BlockRuns,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    protected: BlockRuns::new(),
+    clean: BlockRuns::new(),
     absent: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn guard_is_clean(start: usize, end: usize) -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    first < last && guards().clean.contains_range(first, last)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -403,36 +569,32 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if !ask {
         let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
-    if !known && !is_view(start, end) {
+        if first < last && g.clean.contains_range(first, last) {
+            return Some(Vec::new());
+        }
+        let known = g.protected.contains(&first) || g.absent.contains(&first);
+        drop(g);
+        if !known && !is_view(start, end) {
+            return None;
+        }
+    } else if !is_view(start, end) {
         return None;
     }
     install();
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    if first < last && g.clean.contains_range(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
-    let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        let is_clean = block < last && g.clean.contains(&block);
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
@@ -524,8 +686,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.protected.insert_range(from, to);
+        g.clean.insert_range(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -560,19 +722,33 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let runs = g.protected.overlapping_ranges(first, last);
+    if runs.is_empty() {
+        return false;
     }
-    !blocks.is_empty()
+    g.protected.remove_range(first, last);
+    g.clean.remove_range(first, last);
+    for (from, to) in runs {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        let ok = unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if !ok {
+            for block in from..to {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -652,10 +828,44 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    g.protected.remove_range(range.start, range.end);
+    g.clean.remove_range(range.start, range.end);
+}
+
+#[cfg(test)]
+mod block_runs_tests {
+    use super::BlockRuns;
+
+    #[test]
+    fn interval_merge_split_and_queries() {
+        let mut r = BlockRuns::new();
+        assert!(!r.contains(&5));
+        assert!(r.contains_range(5, 5));
+        assert!(!r.contains_range(5, 6));
+
+        r.insert_range(10, 15);
+        r.insert_range(20, 25);
+        assert!(r.contains_range(10, 15));
+        assert!(!r.contains_range(10, 16));
+        assert!(r.any_overlapping(14, 15));
+        assert!(!r.any_overlapping(15, 20));
+        assert_eq!(r.overlapping_ranges(12, 22), vec![(12, 15), (20, 22)]);
+
+        // Bridging adjacent/overlapping runs merges into [10, 25)
+        r.insert_range(15, 20);
+        assert!(r.contains_range(10, 25));
+        assert_eq!(r.overlapping_ranges(0, 30), vec![(10, 25)]);
+
+        // Removing the middle splits into [10, 13) and [18, 25)
+        r.remove_range(13, 18);
+        assert!(r.contains_range(10, 13));
+        assert!(!r.any_overlapping(13, 18));
+        assert!(r.contains_range(18, 25));
+        assert_eq!(r.overlapping_ranges(11, 22), vec![(11, 13), (18, 22)]);
+
+        // Removing across multiple runs trims both ends cleanly
+        r.remove_range(12, 20);
+        assert_eq!(r.overlapping_ranges(0, 30), vec![(10, 12), (20, 25)]);
     }
 }
 
