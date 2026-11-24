@@ -397,53 +397,116 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32; 3]>) -> HashSet<Value> {
+    // Optimistic: every value an instruction or phi below could make alike starts alike, and
+    // passes take out what is not until nothing changes (a loop's phi needs its back edge's
+    // value, made after it).
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    // The console thread id's x (v0 on entry): its bits from 6 up are one number for the 64
+    // lanes of a console wave when the group's rows are whole waves.
+    let tid_x = p
+        .inputs
+        .iter()
+        .find(|(r, _)| *r == Reg::V(0))
+        .map(|&(_, v)| v)
+        .filter(|_| p.wave64 && threads.is_some_and(|t| t[0] % 64 == 0));
+    let order = crate::ir::reverse_postorder(&p.blocks);
     let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
+    for &b in &order {
         let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
         for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+            if matches!(phi.reg, Reg::V(_)) {
                 same.insert(phi.value);
             }
         }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                _ => continue,
-            };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
-            }
+        for inst in &block.insts {
+            same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
         }
     }
-    same
+    loop {
+        let mut changed = false;
+        let mut drop = |same: &mut HashSet<Value>, vs: &mut dyn Iterator<Item = Value>| {
+            for v in vs {
+                changed |= same.remove(&v);
+            }
+        };
+        for &b in &order {
+            let block = &p.blocks[b];
+            let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+            for phi in &block.phis {
+                if matches!(phi.reg, Reg::V(_))
+                    && same.contains(&phi.value)
+                    && !(whole && phi.args.iter().all(|a| same.contains(a)))
+                {
+                    drop(&mut same, &mut std::iter::once(phi.value));
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let writes = || inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1);
+                if !writes().any(|w| same.contains(&w)) {
+                    continue;
+                }
+                let name = inst.name();
+                let vec_reads_alike = |same: &HashSet<Value>| {
+                    inst.reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(_)))
+                        .all(|r| same.contains(&r.1))
+                };
+                let alike = if st.guards[b][i].is_some() {
+                    false // lanes outside EXEC keep another value
+                } else if tid_x.is_some()
+                    && name == "v_lshrrev_b32"
+                    && matches!(&inst.fields, Fields::Valu(v)
+                        if v.dpp.is_none() && v.sdwa.is_none()
+                            && matches!(v.src.first(), Some(Operand::Const(k)) if (6..=64).contains(k))
+                            && matches!(v.src.get(1), Some(Operand::Vector { reg: 0, .. })))
+                    && inst.read(Reg::V(0)) == tid_x
+                {
+                    true
+                } else if name.starts_with("ds_read") && !name.contains("addtid") {
+                    // the same LDS address in every lane: one value (a write between the reads of
+                    // the two halves would be a race on the console too)
+                    !inst.reads.iter().any(|r| matches!(r.0, Reg::V(_))) || vec_reads_alike(&same)
+                } else {
+                    match &inst.fields {
+                        Fields::Valu(v)
+                            if v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && !name.starts_with("v_mbcnt")
+                                && !name.starts_with("v_cmpx")
+                                && !name.contains("lane") =>
+                        {
+                            v.src.iter().all(|op| match *op {
+                                Operand::Vector { reg, .. } => {
+                                    // every dword of the operand the instruction reads from that register on
+                                    let read: Vec<Value> = inst
+                                        .reads
+                                        .iter()
+                                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
+                                        .map(|r| r.1)
+                                        .collect();
+                                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                                }
+                                // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                                Operand::Scalar { code, .. } if code != NULL => inst
+                                    .read(Reg::S(code))
+                                    .is_none_or(|x| !is_mask(x) || same.contains(&x)),
+                                _ => true,
+                            })
+                        }
+                        _ => false,
+                    }
+                };
+                if !alike {
+                    drop(&mut same, &mut writes());
+                }
+            }
+        }
+        if !changed {
+            return same;
+        }
+    }
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -931,8 +994,18 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// `VICTORY_HOST_WAVE=<lanes>` stands in when no device set it (the offline
+/// `translate` command), so a translation can be checked as the game sees it.
 pub(super) fn host_max_wave() -> u32 {
-    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+    match HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            static ENV: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *ENV.get_or_init(|| {
+                std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            })
+        }
+        n => n,
+    }
 }
 
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1355,6 +1428,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let group_threads = s.threads;
         Lower {
             s,
             x,
@@ -1400,7 +1474,7 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, group_threads),
                 _ => HashSet::new(),
             },
             exchange,
@@ -6780,11 +6854,11 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
+                        // Also with each host wave taken as a wave of its
+                        // own: the bit is picked by the console lane number
+                        // (`console_lane`, the console thread id within its
+                        // 64), which the split into host waves leaves as it
+                        // is, so a constant pattern stays exact.
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                         // wave64: the register after it holds lanes 32-63.
