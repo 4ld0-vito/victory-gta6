@@ -440,6 +440,19 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// Whether the bound pipeline's shaders can store to buffers (true if
+    /// it has no host pipeline yet), for [`windows`]: a draw that cannot
+    /// leaves the window's records as they are. `VICTORY_WINDOW_KEEP=0`:
+    /// every draw ends the window, as before.
+    fn may_store(&self) -> bool {
+        static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*KEEP.get_or_init(|| std::env::var_os("VICTORY_WINDOW_KEEP").is_none_or(|v| v != "0")) {
+            return true;
+        }
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -1947,7 +1960,11 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        // Only a draw that can store to buffers may change the records a
+        // window holds clamped ([`windows`]).
+        if self.may_store() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2289,7 +2306,11 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        // Only a draw that can store to buffers may change the records a
+        // window holds clamped ([`windows`]).
+        if self.may_store() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2394,7 +2415,11 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        // Only a draw that can store to buffers may change the records a
+        // window holds clamped ([`windows`]).
+        if self.may_store() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
