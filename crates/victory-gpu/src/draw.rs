@@ -99,7 +99,7 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 512;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -1417,6 +1417,8 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        let mut refresh_batch: Vec<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::with_capacity(spans.len());
         for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1437,8 +1439,10 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            let len = (*to - *from).min(shadow.left(*from));
+            refresh_batch.push((shadow, *from as usize, len as usize));
         }
+        list.defer_refreshes(&refresh_batch);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2433,7 +2437,7 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            (step as u32, (if w.records == 1 { 64 } else { w.records * 2 }).min(fit).max(1))
                         } else {
                             (stride, max)
                         }

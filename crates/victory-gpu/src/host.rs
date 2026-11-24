@@ -1556,6 +1556,8 @@ struct CardRange {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// Dirty host-to-card sync + initial hash, executed ahead of the submission's lists.
+    sync: Option<ID3D12CommandList>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -2984,10 +2986,14 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        runs: &[&HostList],
+        flown: bool,
+    ) -> (Option<CardPlan>, Option<std::sync::MutexGuard<'static, u64>>) {
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return None;
+            return (None, None);
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
@@ -3020,10 +3026,12 @@ impl Host {
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
         if declared.is_empty() && dirty.is_empty() {
-            return None;
+            return (None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        let Some(work) = work.as_mut() else {
+            return (None, None);
+        };
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -3039,6 +3047,11 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let inline_sync = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let inline_sync = false;
+        let mut sync_cmd: Option<ID3D12CommandList> = None;
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -3046,12 +3059,13 @@ impl Host {
             };
             let (allocator, list) = &sync;
             // SAFETY: the list's last run finished (it ran ahead of a
-            // submission that was waited for, and came back after that);
+            // submission that was waited for, and it came back after that);
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+                (|| -> windows::core::Result<Option<ID3D12CommandList>> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut compute_bound = false;
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3077,11 +3091,14 @@ impl Host {
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
+                        if !compute_bound {
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            compute_bound = true;
+                        }
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
@@ -3100,18 +3117,27 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
+                    let cmd: ID3D12CommandList = list.cast()?;
+                    if inline_sync {
+                        self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                        Ok(None)
+                    } else {
+                        Ok(Some(cmd))
+                    }
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            match recorded {
+                Ok(cmd) => sync_cmd = cmd,
+                Err(e) => fail(format_args!("host copies in the card's memory could not be brought up to date ({e})")),
             }
             used.push((false, sync));
         }
-        drop(order);
+        if inline_sync {
+            drop(order.take());
+        }
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sync: sync_cmd,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -3197,7 +3223,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
-        Some(plan)
+        (Some(plan), order)
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -3995,8 +4021,11 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        let (mut card, mut card_order) = self.card_before(runs, flown);
+        if let Some(sync) = card.as_mut().and_then(|c| c.sync.take()) {
+            lists.insert(0, Some(sync));
+        }
+        if let Some(check) = card.as_mut().and_then(|c| c.check.take()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
@@ -4005,6 +4034,7 @@ impl Host {
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
+                drop(card_order);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -4046,6 +4076,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                drop(card_order.take());
                 self.card_sent();
                 let waited = self
                     .queue
@@ -4921,6 +4952,25 @@ impl HostList {
         }
     }
 
+    /// Batches multiple [`HostList::defer_refresh`] calls under one lock.
+    pub(crate) fn defer_refreshes(
+        &self,
+        items: &[(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        for &(shadow, address, len) in items {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -5433,9 +5483,21 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Whether title reads use the user-space fault-recovered memcpy
+/// (`VICTORY_SAFE_COPY`, on by default; `0` falls back to `ReadProcessMemory`).
+fn safe_copy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0"))
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if safe_copy_enabled() {
+        // SAFETY: `dst` is mapped writable memory of `len` bytes; `safe_copy`
+        // recovers via VEH and returns `false` if any page of `src` faults.
+        return unsafe { crate::watch::safe_copy(src, dst, len) };
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;

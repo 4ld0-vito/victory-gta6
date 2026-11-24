@@ -659,6 +659,115 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+thread_local! {
+    static SAFE_COPY_RIP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ensures the vectored exception handler for write-guards and [`safe_copy`]
+/// is installed.
+pub(crate) fn ensure_installed() {
+    install();
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+std::arch::global_asm!(
+    ".global victory_safe_copy_asm",
+    "victory_safe_copy_asm:",
+    "    push rsi",
+    "    push rdi",
+    "    lea rax, [rip + 2f]",
+    "    mov qword ptr [r9], rax",
+    "    mov rdi, rdx",
+    "    mov rsi, rcx",
+    "    mov rcx, r8",
+    "    rep movsb",
+    "    mov qword ptr [r9], 0",
+    "    mov eax, 1",
+    "    pop rdi",
+    "    pop rsi",
+    "    ret",
+    "2:",
+    "    mov qword ptr [r9], 0",
+    "    xor eax, eax",
+    "    pop rdi",
+    "    pop rsi",
+    "    ret",
+);
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+unsafe extern "win64" {
+    fn victory_safe_copy_asm(src: *const u8, dst: *mut u8, len: usize, rip_slot: *mut usize) -> u8;
+}
+
+/// Copies `len` bytes from `src` to `dst` in user space without entering the
+/// kernel; returns `false` if any page of `src` triggers an access violation.
+///
+/// # Safety
+/// `dst` must be valid, writable, non-overlapping memory of at least `len` bytes.
+pub(crate) unsafe fn safe_copy(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        ensure_installed();
+        let slot = SAFE_COPY_RIP.with(|c| c.as_ptr());
+        // SAFETY: `dst` is writable for `len` bytes and does not overlap `src`;
+        // any fault while reading `src` jumps to the recovery label via `on_write`.
+        unsafe { victory_safe_copy_asm(src, dst, len, slot) != 0 }
+    }
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        let _ = (src, dst);
+        false
+    }
+}
+
+#[cfg(test)]
+mod safe_copy_tests {
+    use super::safe_copy;
+
+    #[test]
+    fn safe_copy_valid_and_fault_recovery() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let len = 128 << 10;
+        let src: Vec<u8> = (0..len).map(|i| (i * 13 + 7) as u8).collect();
+        let mut dst = vec![0u8; len];
+        // SAFETY: distinct buffers of size `len`.
+        assert!(unsafe { safe_copy(src.as_ptr(), dst.as_mut_ptr(), len) });
+        assert_eq!(src, dst);
+
+        // SAFETY: null `src` must fail cleanly via VEH recovery.
+        assert!(!unsafe { safe_copy(std::ptr::null(), dst.as_mut_ptr(), 64) });
+
+        // SAFETY: reserve 2 pages (PAGE_NOACCESS), commit only page 0 (PAGE_READWRITE).
+        let region = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!region.is_null());
+        let page0 = unsafe { VirtualAlloc(region, 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(page0, region);
+        // SAFETY: page 0 is committed read-write.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(region.cast::<u8>(), 4096);
+            for (i, b) in slice.iter_mut().enumerate() {
+                *b = (i * 5 + 3) as u8;
+            }
+        }
+        let mut out = vec![0u8; 8192];
+        // Crossing into uncommitted page 1 must recover and return false.
+        assert!(!unsafe { safe_copy(region.cast::<u8>(), out.as_mut_ptr(), 8192) });
+        // Reading committed page 0 only must succeed and match.
+        assert!(unsafe { safe_copy(region.cast::<u8>(), out.as_mut_ptr(), 4096) });
+        let expected: Vec<u8> = (0..4096).map(|i| (i * 5 + 3) as u8).collect();
+        assert_eq!(&out[..4096], expected.as_slice());
+        // SAFETY: freeing our test allocation.
+        unsafe {
+            assert_ne!(VirtualFree(region, 0, MEM_RELEASE), 0);
+        }
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -670,28 +779,36 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
-        const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        const WRITE: usize = 1;
+        if r.NumberParameters >= 2 && r.ExceptionInformation[0] == WRITE {
+            let at = r.ExceptionInformation[1];
+            // Held across both checks: another thread may have opened the block
+            // since this one faulted, and a copy may have guarded it again since
+            // (then it is ours again, not read-only for some other reason).
+            let mut g = guards();
+            if open(&mut g, at, at + 1) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if writable(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        let recover = SAFE_COPY_RIP.with(|c| c.get());
+        if recover != 0 {
+            SAFE_COPY_RIP.with(|c| c.set(0));
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `ContextRecord` is valid during exception dispatch.
+            unsafe {
+                (*(*info).ContextRecord).Rip = recover as u64;
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
-        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
