@@ -1844,6 +1844,10 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// The `Step::GpuWrite`s of `copies` again (host copy, address, bytes),
+    /// so `declared_writes` and `card_before` need not walk the thousands
+    /// of refreshes a world list holds to find them.
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Deferred {
@@ -1862,9 +1866,12 @@ impl Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.copies.clear();
-        if self.copies.capacity() > 4096 {
-            self.copies.shrink_to(1024);
+        // World lists hold 10-20k steps each frame: shrinking below that
+        // only made every frame grow them again.
+        if self.copies.capacity() > 65536 {
+            self.copies.shrink_to(16384);
         }
+        self.gpu_writes.clear();
         self.uploads.clear();
         self.upload_bytes = 0;
         self.kept.clear();
@@ -2887,8 +2894,8 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+        for (shadow, address, len) in &list.deferred().gpu_writes {
+            {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -3252,10 +3259,8 @@ impl Host {
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
+            for (shadow, address, len) in &list.deferred().gpu_writes {
+                if shadow.carded() {
                     let range = (*address, *address + *len);
                     match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                         Some((_, ranges)) => {
@@ -5419,9 +5424,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        deferred.gpu_writes.push((shadow.clone(), address, len));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
