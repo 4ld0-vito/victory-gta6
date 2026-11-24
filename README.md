@@ -22,11 +22,12 @@ Take-Two Interactive.
   another layer. Fixes inspired by it were written anew in VIctory's code.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25)
+## Status of this fork (`4ld0-vito` perf track)
 
-**Not playable yet: about 3 frames per second, and shadowed areas are black.**
+**In progress toward 30+ fps playable on Series X; shadowed areas still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+32 GB RAM. See [`AGENTS.md`](AGENTS.md) and [`docs/perf-handoff.md`](docs/perf-handoff.md)
+for the build preset, environment switches, and Phase 8 optimization blueprint.
 
 | Stage | State in this fork |
 |-------|--------------------|
@@ -34,9 +35,9 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-3.5 fps (270-450 ms per frame), from 3-6 seconds per frame at the start |
-| Stability | no driver hang or device loss in normal runs |
+| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet (`VICTORY_BVH_BUILDER`), so anything the sun does not hit directly is black |
+| Frame rate in the world | **5.9–8.2 fps** on heavy scenes (3.1k–4.0k draws), **16.4 fps peak** (`60.8 ms/frame` at ~583 draws) on `perf/phase-7-guards-heap` (`335192f`) with recommended switches (up from 2–3.5 fps baseline); ~21.1 GB peak private RAM |
+| Stability | 0 errors and no driver hang or device loss on Series X runs |
 
 ### What this fork changed (summary)
 
