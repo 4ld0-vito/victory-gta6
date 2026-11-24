@@ -3466,7 +3466,10 @@ impl Host {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut per_shadow: std::collections::BTreeMap<
+                usize,
+                (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
+            > = std::collections::BTreeMap::new();
             for plan in plans {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
@@ -3486,12 +3489,35 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                        if lo < hi {
+                            per_shadow
+                                .entry(copy)
+                                .or_insert_with(|| (r.shadow.clone(), Vec::new()))
+                                .1
+                                .push((lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                }
+            }
+            const MAX_MERGE_CHUNK: usize = 256 << 10;
+            for (_, (shadow, mut spans)) in per_shadow {
+                spans.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+                for (lo, hi) in spans {
+                    match merged.last_mut() {
+                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                        _ => merged.push((lo, hi)),
+                    }
+                }
+                for (lo, hi) in merged {
+                    let mut at_lo = lo;
+                    while at_lo < hi {
+                        let sub_hi = (at_lo + MAX_MERGE_CHUNK).min(hi);
+                        pieces.push((shadow.clone(), at_lo, sub_hi, total));
+                        total += (sub_hi - at_lo) as u64;
+                        at_lo = sub_hi;
+                    }
                 }
             }
         }
@@ -3567,14 +3593,47 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        let written = if pieces.len() >= 4 && wide_merge() {
+            let mut unique: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+            for (shadow, _, _, _) in &pieces {
+                if !unique.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow)) {
+                    unique.push(shadow.clone());
+                }
+            }
+            unique.sort_unstable_by_key(|s| std::sync::Arc::as_ptr(s) as usize);
+            let locks: Vec<_> = unique.iter().map(|s| s.lock_before()).collect();
+            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let chunk_len = (pieces.len() / 6).clamp(1, 32);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            for chunk in pieces.chunks(chunk_len) {
+                let chunk = chunk.to_vec();
+                let total_written = total_written.clone();
+                jobs.push(Box::new(move || {
+                    let mut title = Vec::new();
+                    let mut sum = 0usize;
+                    for (shadow, lo, hi, at) in chunk {
+                        // SAFETY: `buffer` stays alive while `fetch` is borrowed, the fetch finished,
+                        // `locks` hold `before` for all copies, and coalesced chunks are disjoint.
+                        let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                        sum += unsafe { shadow.card_merge_relay_locked(lo, gpu, after, &mut title) };
+                    }
+                    total_written.fetch_add(sum, Ordering::Relaxed);
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+            drop(locks);
+            total_written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -5720,9 +5779,15 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let user_copy = safe_copy_enabled();
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if user_copy {
+            // SAFETY: `crate::watch::writing` already opened guarded blocks, and
+            // `safe_copy` recovers cleanly via VEH if any destination page faults.
+            return unsafe { crate::watch::safe_copy(from, at as *mut u8, n) };
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and

@@ -573,13 +573,33 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let mut i = 0;
+    while i + 8 <= len {
+        let nw = u64::from_ne_bytes(now[i..i + 8].try_into().unwrap());
+        let hw = u64::from_ne_bytes(held[i..i + 8].try_into().unwrap());
+        if nw != hw {
+            for k in 0..8 {
+                let idx = i + k;
+                if now[idx] != held[idx] {
+                    let g = now[idx];
+                    differs |= g ^ title[idx];
+                    title[idx] = g;
+                    held[idx] = g;
+                }
+            }
+        }
+        i += 8;
+    }
+    while i < len {
+        if now[i] != held[i] {
+            let g = now[i];
+            differs |= g ^ title[i];
+            title[i] = g;
+            held[i] = g;
+        }
+        i += 1;
     }
     differs != 0
 }
@@ -1399,6 +1419,41 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn merge_piece_matches_bytewise_behavior() {
+        for len in [0usize, 1, 7, 8, 9, 19, 64, 73] {
+            let held0: Vec<u8> = (0..len).map(|i| (i * 11 + 3) as u8).collect();
+            let mut now = held0.clone();
+            let title0: Vec<u8> = (0..len).map(|i| (i * 29 + 5) as u8).collect();
+            if len > 0 {
+                now[0] ^= 0x55;
+            }
+            if len > 13 {
+                now[13] ^= 0x0f;
+            }
+            if len > 16 {
+                now[16] = title0[16];
+            }
+            let mut held_fast = held0.clone();
+            let mut title_fast = title0.clone();
+            let changed_fast = super::merge_piece(&now, &mut held_fast, &mut title_fast);
+
+            let mut held_ref = held0;
+            let mut title_ref = title0;
+            let mut differs = 0u8;
+            for ((n, h), t) in now.iter().zip(held_ref.iter_mut()).zip(title_ref.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            assert_eq!(changed_fast, differs != 0);
+            assert_eq!(held_fast, held_ref);
+            assert_eq!(title_fast, title_ref);
+        }
     }
 }
 
@@ -2633,7 +2688,31 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
+    /// Locks the per-copy CPU-side merge lock so disjoint [`card_merge_relay_locked`]
+    /// calls can run in parallel across worker threads.
+    pub(crate) fn lock_before(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let _side = self.lock_before();
+        // SAFETY: caller serializes via `lock_before()`.
+        unsafe { self.card_merge_relay_locked(at, gpu, fetched_after, title) }
+    }
+
+    /// Body of [`Shadow::card_merge_relay`] when caller already holds [`Shadow::lock_before`]
+    /// and ensures concurrent calls for the same copy cover disjoint `[at, at + gpu.len())` ranges.
+    ///
+    /// # Safety
+    /// Caller must hold `self.lock_before()` and guarantee disjoint `at..at + gpu.len()`
+    /// slices across concurrent threads for the same `Shadow`.
+    pub(crate) unsafe fn card_merge_relay_locked(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+    ) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -2641,11 +2720,9 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
-        // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // range declared and not done with, which no refresh writes; and the
+        // caller holds `lock_before()` with disjoint slices per worker.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;

@@ -526,6 +526,34 @@ impl BlockRuns {
             }
         }
     }
+
+    fn missing_ranges(&self, first: usize, last: usize) -> Vec<(usize, usize)> {
+        if first >= last {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cur = first;
+        let start_key = self
+            .0
+            .range(..=first)
+            .next_back()
+            .map_or(first, |(&s, &e)| if e > first { s } else { first });
+        for (&s, &e) in self.0.range(start_key..last) {
+            if s > cur {
+                out.push((cur, s.min(last)));
+            }
+            if e > cur {
+                cur = e.min(last);
+            }
+            if cur >= last {
+                break;
+            }
+        }
+        if cur < last {
+            out.push((cur, last));
+        }
+        out
+    }
 }
 
 struct Guards {
@@ -593,32 +621,33 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return Some(written);
     }
     let mut uncommitted_until = first;
-    for block in first..=last {
-        let is_clean = block < last && g.clean.contains(&block);
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+    for (m_from, m_to) in g.clean.missing_ranges(first, last) {
+        for block in m_from..=m_to {
+            let mut open = block < m_to;
+            if open && g.absent.contains(&block) {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                }
             }
-            open = block >= uncommitted_until;
             if open {
-                g.absent.remove(&block);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                if g.protected.contains(&block) {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block);
+                } else {
+                    run.get_or_insert(block);
+                    continue;
+                }
             }
-        }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
             }
-        }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
         }
     }
     Some(written)
@@ -866,6 +895,11 @@ mod block_runs_tests {
         // Removing across multiple runs trims both ends cleanly
         r.remove_range(12, 20);
         assert_eq!(r.overlapping_ranges(0, 30), vec![(10, 12), (20, 25)]);
+
+        assert_eq!(r.missing_ranges(0, 30), vec![(0, 10), (12, 20), (25, 30)]);
+        assert_eq!(r.missing_ranges(10, 12), Vec::<(usize, usize)>::new());
+        assert_eq!(r.missing_ranges(11, 22), vec![(12, 20)]);
+        assert_eq!(BlockRuns::new().missing_ranges(5, 9), vec![(5, 9)]);
     }
 }
 
@@ -967,6 +1001,10 @@ mod safe_copy_tests {
         let mut out = vec![0u8; 8192];
         // Crossing into uncommitted page 1 must recover and return false.
         assert!(!unsafe { safe_copy(region.cast::<u8>(), out.as_mut_ptr(), 8192) });
+        // Writing to uncommitted/no-access destination must also recover and return false.
+        assert!(!unsafe {
+            safe_copy(src.as_ptr(), region.cast::<u8>().add(4096), 64)
+        });
         // Reading committed page 0 only must succeed and match.
         assert!(unsafe { safe_copy(region.cast::<u8>(), out.as_mut_ptr(), 4096) });
         let expected: Vec<u8> = (0..4096).map(|i| (i * 5 + 3) as u8).collect();

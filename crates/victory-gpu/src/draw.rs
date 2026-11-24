@@ -1301,14 +1301,28 @@ impl State {
         // incremental 1024-slot sweep are rescanned each pass, and `spans`
         // is rebuilt only when `ranges` actually changed.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        #[derive(Default)]
+        type SpansVec = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         struct HeapCache {
             passes: u64,
             ranges: Ranges,
-            spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            spans: std::sync::Arc<SpansVec>,
             spans_dirty: bool,
             all_slots: Vec<u32>,
             sweep_cursor: usize,
+        }
+        impl Default for HeapCache {
+            fn default() -> Self {
+                Self {
+                    passes: 0,
+                    ranges: Ranges::new(),
+                    by_copy: std::collections::HashMap::new(),
+                    spans: std::sync::Arc::new(Vec::new()),
+                    spans_dirty: false,
+                    all_slots: Vec::new(),
+                    sweep_cursor: 0,
+                }
+            }
         }
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapCache>>> =
             std::sync::Mutex::new(None);
@@ -1327,7 +1341,7 @@ impl State {
                 cache.all_slots = host.buffer_slots();
                 cache.sweep_cursor = 0;
             }
-            let end = (cache.sweep_cursor + 1024).min(cache.all_slots.len());
+            let end = (cache.sweep_cursor + 128).min(cache.all_slots.len());
             let mut to_scan = changed;
             to_scan.extend_from_slice(&cache.all_slots[cache.sweep_cursor..end]);
             cache.sweep_cursor = end;
@@ -1340,17 +1354,32 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut full_rebuild = false;
+        let check_shrink = |by_copy: &std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        >,
+                            old: &(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+                            full_rebuild: &mut bool| {
+            if *full_rebuild {
+                return;
+            }
+            let key = std::sync::Arc::as_ptr(&old.0) as usize;
+            if by_copy.get(&key).is_none_or(|(_, min, max)| old.1 <= *min || old.2 >= *max) {
+                *full_rebuild = true;
+            }
+        };
         for (n, &index) in slots.iter().enumerate() {
             let old = cache.ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
-                if old.is_some() {
-                    cache.spans_dirty = true;
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
                 }
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
-                if old.is_some() {
-                    cache.spans_dirty = true;
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
                 }
                 continue;
             };
@@ -1372,8 +1401,8 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                if old.is_some() {
-                    cache.spans_dirty = true;
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
                 }
                 continue;
             };
@@ -1382,29 +1411,52 @@ impl State {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             let new_end = address + len;
-            let same = old.is_some_and(|(os, oa, oe)| {
-                std::sync::Arc::ptr_eq(&os, &shadow) && oa == address && oe == new_end
+            let same = old.as_ref().is_some_and(|(os, oa, oe)| {
+                std::sync::Arc::ptr_eq(os, &shadow) && *oa == address && *oe == new_end
             });
             if !same {
-                cache.spans_dirty = true;
+                if let Some(old) = old {
+                    let same_shadow = std::sync::Arc::ptr_eq(&old.0, &shadow);
+                    if !same_shadow || address > old.1 || new_end < old.2 {
+                        check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                    }
+                }
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                match cache.by_copy.get_mut(&key) {
+                    Some(span) => {
+                        if address < span.1 {
+                            span.1 = address;
+                            cache.spans_dirty = true;
+                        }
+                        if new_end > span.2 {
+                            span.2 = new_end;
+                            cache.spans_dirty = true;
+                        }
+                    }
+                    None => {
+                        cache.by_copy.insert(key, (shadow.clone(), address, new_end));
+                        cache.spans_dirty = true;
+                    }
+                }
             }
             cache.ranges.insert(index, (shadow, address, new_end));
         }
         let views = cache.ranges.len() as u32;
-        if cache.spans_dirty || (cache.spans.is_empty() && !cache.ranges.is_empty()) {
-            // Per host copy, the span its picked views cover.
-            let mut by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-                std::collections::HashMap::new();
+        if full_rebuild || (cache.spans.is_empty() && !cache.ranges.is_empty()) {
+            cache.by_copy.clear();
             for (shadow, from, to) in cache.ranges.values() {
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
-                let span = by_copy.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                let span = cache.by_copy.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
                 span.1 = span.1.min(*from);
                 span.2 = span.2.max(*to);
             }
-            cache.spans = by_copy.into_values().collect();
+            cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
+            cache.spans_dirty = false;
+        } else if cache.spans_dirty {
+            cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
             cache.spans_dirty = false;
         }
-        let spans = cache.spans.clone();
+        let spans = std::sync::Arc::clone(&cache.spans);
         drop(kept);
         let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
@@ -1419,7 +1471,7 @@ impl State {
         let whole = whole.get_or_insert_with(Default::default);
         let mut refresh_batch: Vec<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::with_capacity(spans.len());
-        for (shadow, from, to) in &spans {
+        for (shadow, from, to) in spans.iter() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
