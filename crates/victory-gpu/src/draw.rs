@@ -66,6 +66,27 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage that reads title memory by address is bound: its root
+    /// views take the copy the directory gives ([`view_copy`]).
+    static BY_ADDRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The host copy of a root view at `address`: its title buffer's, or for a
+/// shader that also reads title memory by address, the copy the directory
+/// of [`crate::memory`] gives that page when it holds the whole view.
+fn view_copy(address: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let root = crate::shadow::find(address, 1)?;
+    if !BY_ADDRESS.get() || !by_address_views() {
+        return Some(root);
+    }
+    Some(crate::memory::copy_for_view(address, &root).unwrap_or(root))
+}
+
+/// `VICTORY_BVH_VIEWS_DIRECTORY=0`: root views of shaders that read title
+/// memory by address take their buffer's own copy, as before.
+fn by_address_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_VIEWS_DIRECTORY").is_none_or(|v| v != "0"))
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -383,7 +404,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = view_copy(address)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -694,7 +715,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
+                Some(&Root::View(address)) => view_copy(address).map_or(0, |s| {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                     ((s.gpu(address) - base) & 15) as u32
@@ -925,6 +946,7 @@ impl State {
             } else {
                 None
             };
+            BY_ADDRESS.set(memory.is_some());
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -1057,6 +1079,7 @@ impl State {
                 }
             }
         }
+        BY_ADDRESS.set(false);
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
@@ -1091,7 +1114,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = view_copy(a)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1205,12 +1228,12 @@ impl State {
         // (title addresses stay below bit 63).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63,
+            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(BY_ADDRESS.get()) << 62,
         );
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| view_copy(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
