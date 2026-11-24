@@ -229,11 +229,12 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    // Pages are mapped one after the other or overlap.
     if let Some(last) = ranges.last_mut()
-        && last.1 == start
+        && start <= last.1
+        && end >= last.0
     {
-        last.1 = end;
+        *last = (last.0.min(start), last.1.max(end));
         return;
     }
     if ranges.len() >= MOST {
@@ -832,9 +833,20 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
+        }
+        if ranges.len() > 1 {
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            ranges = merged;
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());

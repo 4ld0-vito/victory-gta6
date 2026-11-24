@@ -16,8 +16,8 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -99,6 +99,10 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Set when `dirty` becomes non-empty so `card_dirty` checks only modified copies.
+    dirty_flag: AtomicBool,
+    /// Weak handle to the owning `Shadow`, initialized right after `Arc::new`.
+    self_weak: OnceLock<Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -151,7 +155,12 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let min_bytes = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|kb| (kb << 10).max(4 << 10))
+            .unwrap_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20));
+        (min_bytes, mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
@@ -160,6 +169,9 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Copies in the card's memory that currently have pending dirty ranges.
+static DIRTY_CARDS: Mutex<Vec<Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -173,7 +185,9 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.retain(|w| w.strong_count() > 0);
+    out[7] = carded.len() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -291,20 +305,25 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let candidates = std::mem::take(&mut *DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()));
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(candidates.len());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    let is_relay = relay();
+    for weak in candidates {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
         let ranges = shadow
             .card
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                c.dirty_flag.store(false, Ordering::Release);
                 let ranges = std::mem::take(&mut *dirty);
-                if relay() {
+                if is_relay && !ranges.is_empty() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
@@ -315,8 +334,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
-        true
-    });
+    }
     out
 }
 
@@ -555,13 +573,33 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let mut i = 0;
+    while i + 8 <= len {
+        let nw = u64::from_ne_bytes(now[i..i + 8].try_into().unwrap());
+        let hw = u64::from_ne_bytes(held[i..i + 8].try_into().unwrap());
+        if nw != hw {
+            for k in 0..8 {
+                let idx = i + k;
+                if now[idx] != held[idx] {
+                    let g = now[idx];
+                    differs |= g ^ title[idx];
+                    title[idx] = g;
+                    held[idx] = g;
+                }
+            }
+        }
+        i += 8;
+    }
+    while i < len {
+        if now[i] != held[i] {
+            let g = now[i];
+            differs |= g ^ title[i];
+            title[i] = g;
+            held[i] = g;
+        }
+        i += 1;
     }
     differs != 0
 }
@@ -846,7 +884,9 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
-const NOT_WATCHED: u8 = 2;
+const WATCHED_KERNEL: u8 = 1;
+const WATCHED_GUARD: u8 = 2;
+const NOT_WATCHED: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1380,6 +1420,41 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn merge_piece_matches_bytewise_behavior() {
+        for len in [0usize, 1, 7, 8, 9, 19, 64, 73] {
+            let held0: Vec<u8> = (0..len).map(|i| (i * 11 + 3) as u8).collect();
+            let mut now = held0.clone();
+            let title0: Vec<u8> = (0..len).map(|i| (i * 29 + 5) as u8).collect();
+            if len > 0 {
+                now[0] ^= 0x55;
+            }
+            if len > 13 {
+                now[13] ^= 0x0f;
+            }
+            if len > 16 {
+                now[16] = title0[16];
+            }
+            let mut held_fast = held0.clone();
+            let mut title_fast = title0.clone();
+            let changed_fast = super::merge_piece(&now, &mut held_fast, &mut title_fast);
+
+            let mut held_ref = held0;
+            let mut title_ref = title0;
+            let mut differs = 0u8;
+            for ((n, h), t) in now.iter().zip(held_ref.iter_mut()).zip(title_ref.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            assert_eq!(changed_fast, differs != 0);
+            assert_eq!(held_fast, held_ref);
+            assert_eq!(title_fast, title_ref);
+        }
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -1658,6 +1733,11 @@ impl Shadow {
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// Whether the memory behind the copy is view memory tracked by guards.
+    pub(crate) fn is_guarded(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == WATCHED_GUARD
     }
 
     /// The copy's own number (see the field).
@@ -2386,9 +2466,13 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        let w = self.watched.load(Ordering::Relaxed);
+        if w != NOT_WATCHED {
+            if let Some((now, written, guarded)) = crate::watch::writes_ex(from, to, true, w == WATCHED_GUARD) {
+                self.watched.store(
+                    if guarded { WATCHED_GUARD } else { WATCHED_KERNEL },
+                    Ordering::Relaxed,
+                );
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2475,10 +2559,16 @@ impl Shadow {
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        let notify = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+            !card.dirty_flag.swap(true, Ordering::AcqRel)
+        };
+        if notify && let Some(weak) = card.self_weak.get() {
+            DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
         }
     }
 
@@ -2598,7 +2688,31 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
+    /// Locks the per-copy CPU-side merge lock so disjoint [`card_merge_relay_locked`]
+    /// calls can run in parallel across worker threads.
+    pub(crate) fn lock_before(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let _side = self.lock_before();
+        // SAFETY: caller serializes via `lock_before()`.
+        unsafe { self.card_merge_relay_locked(at, gpu, fetched_after, title) }
+    }
+
+    /// Body of [`Shadow::card_merge_relay`] when caller already holds [`Shadow::lock_before`]
+    /// and ensures concurrent calls for the same copy cover disjoint `[at, at + gpu.len())` ranges.
+    ///
+    /// # Safety
+    /// Caller must hold `self.lock_before()` and guarantee disjoint `at..at + gpu.len()`
+    /// slices across concurrent threads for the same `Shadow`.
+    pub(crate) unsafe fn card_merge_relay_locked(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+    ) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -2606,11 +2720,9 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
-        // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // range declared and not done with, which no refresh writes; and the
+        // caller holds `lock_before()` with disjoint slices per worker.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
@@ -2806,6 +2918,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    dirty_flag: AtomicBool::new(false),
+                    self_weak: OnceLock::new(),
                     size,
                 };
                 (on_card, Some(card))
@@ -2830,8 +2944,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        if let Some(c) = &shadow.card {
+            let weak = Arc::downgrade(&shadow);
+            let _ = c.self_weak.set(weak.clone());
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
         }
         entry.shadow = Some(shadow);
     }
@@ -3022,6 +3138,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                dirty_flag: AtomicBool::new(false),
+                self_weak: OnceLock::new(),
                 size: len,
             };
             (on_card, Some(card))
@@ -3039,8 +3157,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    if let Some(c) = &shadow.card {
+        let weak = Arc::downgrade(&shadow);
+        let _ = c.self_weak.set(weak.clone());
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

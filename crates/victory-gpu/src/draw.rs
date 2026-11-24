@@ -99,7 +99,7 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 512;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -391,6 +391,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
+    }
+    if crate::host::gpu_cbv_copy()
+        && let Some(cbv_gpu) = list.cbv_copy(&shadow.buffer, shadow.offset(address), len)
+    {
+        shadow.refresh(list, address, len);
+        return Some(cbv_gpu);
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
@@ -1297,37 +1303,90 @@ impl State {
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // reads, kept from pass to pass. Only changed slots and an
+        // incremental 1024-slot sweep are rescanned each pass, and `spans`
+        // is rebuilt only when `ranges` actually changed.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type SpansVec = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        struct HeapCache {
+            passes: u64,
+            ranges: Ranges,
+            by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            spans: std::sync::Arc<SpansVec>,
+            spans_dirty: bool,
+            all_slots: Vec<u32>,
+            sweep_cursor: usize,
+        }
+        impl Default for HeapCache {
+            fn default() -> Self {
+                Self {
+                    passes: 0,
+                    ranges: Ranges::new(),
+                    by_copy: std::collections::HashMap::new(),
+                    spans: std::sync::Arc::new(Vec::new()),
+                    spans_dirty: false,
+                    all_slots: Vec::new(),
+                    sweep_cursor: 0,
+                }
+            }
+        }
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapCache>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let cache = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
+        let slots: Vec<u32> = if cache.passes == 0 {
+            cache.all_slots = host.buffer_slots();
+            cache.sweep_cursor = cache.all_slots.len();
+            cache.all_slots.clone()
         } else {
-            changed
+            if cache.all_slots.is_empty() || cache.sweep_cursor >= cache.all_slots.len() {
+                cache.all_slots = host.buffer_slots();
+                cache.sweep_cursor = 0;
+            }
+            let end = (cache.sweep_cursor + 128).min(cache.all_slots.len());
+            let mut to_scan = changed;
+            to_scan.extend_from_slice(&cache.all_slots[cache.sweep_cursor..end]);
+            cache.sweep_cursor = end;
+            to_scan.sort_unstable();
+            to_scan.dedup();
+            to_scan
         };
-        *passes += 1;
+        cache.passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut full_rebuild = false;
+        let check_shrink = |by_copy: &std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        >,
+                            old: &(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+                            full_rebuild: &mut bool| {
+            if *full_rebuild {
+                return;
+            }
+            let key = std::sync::Arc::as_ptr(&old.0) as usize;
+            if by_copy.get(&key).is_none_or(|(_, min, max)| old.1 <= *min || old.2 >= *max) {
+                *full_rebuild = true;
+            }
+        };
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            let old = cache.ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                }
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1348,26 +1407,64 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                if let Some(old) = old {
+                    check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let new_end = address + len;
+            let same = old.as_ref().is_some_and(|(os, oa, oe)| {
+                std::sync::Arc::ptr_eq(os, &shadow) && *oa == address && *oe == new_end
+            });
+            if !same {
+                if let Some(old) = old {
+                    let same_shadow = std::sync::Arc::ptr_eq(&old.0, &shadow);
+                    if !same_shadow || address > old.1 || new_end < old.2 {
+                        check_shrink(&cache.by_copy, &old, &mut full_rebuild);
+                    }
+                }
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                match cache.by_copy.get_mut(&key) {
+                    Some(span) => {
+                        if address < span.1 {
+                            span.1 = address;
+                            cache.spans_dirty = true;
+                        }
+                        if new_end > span.2 {
+                            span.2 = new_end;
+                            cache.spans_dirty = true;
+                        }
+                    }
+                    None => {
+                        cache.by_copy.insert(key, (shadow.clone(), address, new_end));
+                        cache.spans_dirty = true;
+                    }
+                }
+            }
+            cache.ranges.insert(index, (shadow, address, new_end));
         }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        let views = cache.ranges.len() as u32;
+        if full_rebuild || (cache.spans.is_empty() && !cache.ranges.is_empty()) {
+            cache.by_copy.clear();
+            for (shadow, from, to) in cache.ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = cache.by_copy.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
+            cache.spans_dirty = false;
+        } else if cache.spans_dirty {
+            cache.spans = std::sync::Arc::new(cache.by_copy.values().cloned().collect());
+            cache.spans_dirty = false;
         }
+        let spans = std::sync::Arc::clone(&cache.spans);
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1378,7 +1475,9 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        let mut refresh_batch: Vec<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::with_capacity(spans.len());
+        for (shadow, from, to) in spans.iter() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1398,8 +1497,10 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            let len = (*to - *from).min(shadow.left(*from));
+            refresh_batch.push((shadow, *from as usize, len as usize));
         }
+        list.defer_refreshes(&refresh_batch);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1499,10 +1600,17 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_HEAP_TEX_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(250);
+            std::time::Duration::from_millis(ms)
+        });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2006,7 +2114,26 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let len = u64::from(size);
+                        if let Some(shadow) = crate::shadow::find(address, len.max(1))
+                            && len <= shadow.left(address)
+                        {
+                            let gpu = shadow.gpu(address);
+                            if gpu % 256 == 0 {
+                                shadow.refresh(list, address, len);
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                            if crate::host::gpu_cbv_copy()
+                                && let Some(cbv_gpu) =
+                                    list.cbv_copy(&shadow.buffer, shadow.offset(address), len)
+                            {
+                                shadow.refresh(list, address, len);
+                                host.constant_at(index, cbv_gpu, size);
+                                continue;
+                            }
+                        }
+                        let Some((gpu, to)) = list.scratch(len) else {
                             host.make_null(index);
                             continue;
                         };
@@ -2387,7 +2514,7 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            (step as u32, (if w.records == 1 { 64 } else { w.records * 2 }).min(fit).max(1))
                         } else {
                             (stride, max)
                         }
