@@ -1462,29 +1462,46 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 sh[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    if (gid.x >= pieces) return;
+    uint piece = first + gid.x;
+    uint tid = gtid.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u ^ tid, 0x85EBCA6Bu + tid * 17u, 0xC2B2AE35u ^ (tid * 31u), 0x27D4EB2Fu + tid * 53u);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = lo + tid * 16u; at < hi; at += 1024u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    sh[tid] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            uint4 o = sh[tid + s];
+            h = (h ^ (o * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du)))
+                * uint4(0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu, 0x9E3779B9u);
+            h = h.yzwx ^ (h >> 15);
+            sh[tid] = h;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        if (compare != 0u) {
+            differs.Store(out_at + gid.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            // With the copy-back on its own thread: the next compare of the
+            // piece finds what is written from here on.
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
     }
 }
 "#;
@@ -3075,9 +3092,11 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            if run.pieces > 0 {
+                                let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
+                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                list.Dispatch(run.pieces, 1, 1);
+                            }
                         }
                     }
                     list.Close()?;
@@ -3162,7 +3181,9 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        if r.span.pieces > 0 {
+                            list.Dispatch(r.span.pieces, 1, 1);
+                        }
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;

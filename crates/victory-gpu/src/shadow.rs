@@ -151,7 +151,12 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let min_bytes = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|kb| (kb << 10).max(4 << 10))
+            .unwrap_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20));
+        (min_bytes, mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
