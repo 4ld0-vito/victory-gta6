@@ -572,6 +572,22 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
+/// `VICTORY_BACK_CONFLICTS=1`: copy-backs count (and log) bytes the title
+/// changed too; on with `VICTORY_BACK_TITLE_WINS=1`, which keeps the
+/// title's byte there.
+fn back_conflicts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| title_wins() || std::env::var_os("VICTORY_BACK_CONFLICTS").is_some_and(|v| v == "1"))
+}
+
+fn title_wins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_TITLE_WINS").is_some_and(|v| v == "1"))
+}
+
+static CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static CONFLICT_SAID: AtomicU64 = AtomicU64::new(0);
+
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
@@ -2021,12 +2037,46 @@ impl Shadow {
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
                 let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
+                if back_conflicts() {
+                    // Bytes the copy changed that the title changed too, to
+                    // another value: either both wrote them, or the copy's
+                    // byte is an older title byte a later refresh put in
+                    // after the snapshot (putting it back reverts the
+                    // title's newer write).
+                    let mut conflicts = 0usize;
+                    let wins = title_wins();
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                        let changed = *h != *o;
+                        let conflict = changed && *t != *o && *t != *h;
+                        conflicts += usize::from(conflict);
+                        let gpu = if changed && !(wins && conflict) { 0xffu8 } else { 0 };
+                        let merged = (*t & !gpu) | (*h & gpu);
+                        differs |= merged ^ *t;
+                        *t = merged;
+                        *h = merged;
+                    }
+                    if conflicts > 0 {
+                        CONFLICTS.fetch_add(conflicts as u64, Ordering::Relaxed);
+                        if CONFLICT_SAID.fetch_add(1, Ordering::Relaxed) < 60 {
+                            tracing::warn!(
+                                at = format_args!("{:#x}", start + at),
+                                bytes = n,
+                                conflicts,
+                                window = self.window,
+                                copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+                                title_wins = wins,
+                                "copy back: bytes the copy changed that the title also changed to another value"
+                            );
+                        }
+                    }
+                } else {
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                        let gpu = if *h != *o { 0xffu8 } else { 0 };
+                        let merged = (*t & !gpu) | (*h & gpu);
+                        differs |= merged ^ *t;
+                        *t = merged;
+                        *h = merged;
+                    }
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);

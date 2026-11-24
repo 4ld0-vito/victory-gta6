@@ -314,6 +314,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    crate::writetrace::arm();
     true
 }
 
