@@ -822,6 +822,113 @@ mod tests {
             let _ = windows::Win32::Foundation::CloseHandle(event);
         }
     }
+
+    #[test]
+    fn warp_cbv_copy_aligns_unaligned_offset() {
+        let Ok(adapter) = warp_adapter() else { return };
+        // SAFETY: WARP D3D12 device, direct queue, upload/default/readback buffers.
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                return;
+            }
+            let Some(dev) = dev else { return };
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let make_buf = |heap_type: D3D12_HEAP_TYPE, width: u64| -> ID3D12Resource {
+                let mut res: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: heap_type,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: width,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut res,
+                )
+                .unwrap();
+                res.unwrap()
+            };
+            let upload = make_buf(D3D12_HEAP_TYPE_UPLOAD, 512);
+            let src_default = make_buf(D3D12_HEAP_TYPE_DEFAULT, 512);
+            let cbv_chunk = make_buf(D3D12_HEAP_TYPE_DEFAULT, 1024);
+            let readback = make_buf(D3D12_HEAP_TYPE_READBACK, 512);
+
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut ptr)).unwrap();
+            let pattern: Vec<u8> = (0..512usize).map(|i| (i * 23 + 11) as u8).collect();
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), ptr.cast(), 512);
+            upload.Unmap(0, None);
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.CopyBufferRegion(&src_default, 0, &upload, 0, 512);
+            list.Close().unwrap();
+
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            alloc.Reset().unwrap();
+            list.Reset(&alloc, None).unwrap();
+            list.CopyBufferRegion(&cbv_chunk, 0, &src_default, 16, 256);
+            list.ResourceBarrier(&[transition(
+                &cbv_chunk,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+            list.ResourceBarrier(&[transition(
+                &cbv_chunk,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            list.CopyBufferRegion(&cbv_chunk, 256, &src_default, 32, 256);
+            list.ResourceBarrier(&[transition(
+                &cbv_chunk,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+            list.ResourceBarrier(&[transition(
+                &cbv_chunk,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &cbv_chunk, 0, 512);
+            list.Close().unwrap();
+
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 2).unwrap();
+            fence.SetEventOnCompletion(2, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            let mut out_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut out_ptr)).unwrap();
+            let got = std::slice::from_raw_parts(out_ptr.cast::<u8>(), 512);
+            assert_eq!(&got[0..256], &pattern[16..272]);
+            assert_eq!(&got[256..512], &pattern[32..288]);
+            readback.Unmap(0, None);
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+        }
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -854,6 +961,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local scratch buffers for 256-byte aligned CBV copies on the GPU.
+    cbv_scratch: Mutex<CbvScratch>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2997,6 +3106,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                cbv_scratch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -3210,6 +3320,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let mut compute_bound = false;
+                    let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3219,7 +3330,15 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        let has_writes = !ranges.is_empty();
                         let Some(before) = before else {
+                            if has_writes {
+                                post_barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                ));
+                            }
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -3228,12 +3347,17 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if has_writes {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
+                            post_barriers.push(transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ));
                         }
                         if !compute_bound {
                             list.SetComputeRootSignature(&work.root);
@@ -3259,6 +3383,9 @@ impl Host {
                                 list.Dispatch(run.pieces, 1, 1);
                             }
                         }
+                    }
+                    if !post_barriers.is_empty() {
+                        list.ResourceBarrier(&post_barriers);
                     }
                     list.Close()?;
                     let cmd: ID3D12CommandList = list.cast()?;
@@ -4622,7 +4749,69 @@ impl Host {
     }
 }
 
+/// Whether unaligned constant buffer views copy on the GPU (`VICTORY_GPU_CBV_COPY`,
+/// on by default; `0` falls back to CPU `defer_fill`).
+pub(crate) fn gpu_cbv_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CBV_COPY").is_none_or(|v| v != "0"))
+}
+
+#[derive(Default)]
+struct CbvScratch {
+    chunks: Vec<(ID3D12Resource, u64, u64, bool)>,
+    current: usize,
+    used: u64,
+}
+
 impl HostList {
+    /// Copies `len` bytes starting at `src_offset` of `src` into a 256-byte
+    /// aligned region of a device-local scratch buffer on `&self.list`,
+    /// returning the aligned host GPU virtual address.
+    pub(crate) fn cbv_copy(&self, src: &ID3D12Resource, src_offset: u64, len: u64) -> Option<u64> {
+        if len == 0 {
+            return None;
+        }
+        let alloc_len = len.next_multiple_of(256);
+        let mut cbv = self.cbv_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        while cbv.current < cbv.chunks.len() && cbv.used + alloc_len > cbv.chunks[cbv.current].2 {
+            cbv.current += 1;
+            cbv.used = 0;
+        }
+        if cbv.current == cbv.chunks.len() {
+            let size = alloc_len.max(1 << 20);
+            let buffer = host()?.default_buffer(size)?;
+            name(&buffer, || format!("list cbv scratch {size:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            cbv.chunks.push((buffer, gpu, size, false));
+            cbv.used = 0;
+        }
+        let cur = cbv.current;
+        let at = cbv.used;
+        cbv.used += alloc_len;
+        let (buf, gpu_base, _, in_cbv) = &mut cbv.chunks[cur];
+        let out_gpu = *gpu_base + at;
+        // SAFETY: `self.list` is open; `buf` is alive and tracked via `in_cbv`;
+        // `src` is in `COMMON`/`GENERIC_READ` via implicit promotion.
+        unsafe {
+            if *in_cbv {
+                self.list.ResourceBarrier(&[transition(
+                    buf,
+                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            self.list.CopyBufferRegion(&*buf, at, src, src_offset, len);
+            self.list.ResourceBarrier(&[transition(
+                buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+        }
+        *in_cbv = true;
+        Some(out_gpu)
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -4737,6 +4926,16 @@ impl HostList {
             // scratch memory any more, and the next list to ask takes it.
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
+            }
+        }
+        {
+            let mut cbv = self.cbv_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (cbv.current, cbv.used) = (0, 0);
+            if cbv.chunks.len() > 4 {
+                cbv.chunks.truncate(4);
+            }
+            for c in &mut cbv.chunks {
+                c.3 = false;
             }
         }
         // SAFETY: the list is not executing.
@@ -5659,7 +5858,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
+    if !title_dst && len >= 4096 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
@@ -5703,13 +5902,14 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
 
 fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. Uses kernel reads to
+    // avoid hardware VEH trap overhead on expected unmapped holes.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_kernel(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_kernel(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -5733,6 +5933,15 @@ fn safe_copy_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0"))
 }
 
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the destination is mapped writable memory of `len` bytes; the
+    // kernel checks the source.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
@@ -5741,12 +5950,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         // recovers via VEH and returns `false` if any page of `src` faults.
         return unsafe { crate::watch::safe_copy(src, dst, len) };
     }
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    read_kernel(src, dst, len)
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -5781,13 +5985,8 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let user_copy = safe_copy_enabled();
     let direct = direct_writes();
-    let write = |at: usize, n: usize| {
+    let write_kernel = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
-        if user_copy {
-            // SAFETY: `crate::watch::writing` already opened guarded blocks, and
-            // `safe_copy` recovers cleanly via VEH if any destination page faults.
-            return unsafe { crate::watch::safe_copy(from, at as *mut u8, n) };
-        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and
@@ -5801,13 +6000,22 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    let write_fast = |at: usize, n: usize| {
+        if user_copy {
+            let from = src.wrapping_add(at - dst as usize);
+            // SAFETY: `crate::watch::writing` already opened guarded blocks, and
+            // `safe_copy` recovers cleanly via VEH if any destination page faults.
+            return unsafe { crate::watch::safe_copy(from, at as *mut u8, n) };
+        }
+        write_kernel(at, n)
+    };
+    if len == 0 || write_fast(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !write_kernel(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                write_kernel(at, n);
             });
         }
     });
@@ -6483,6 +6691,49 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    /// Device-local default buffer of `size` bytes (no UAV flag), in `COMMON`.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a device-local buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no host default buffer");
+                None
+            }
+        }
+    }
+
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);

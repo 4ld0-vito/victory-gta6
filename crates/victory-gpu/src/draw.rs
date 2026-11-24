@@ -392,6 +392,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if crate::host::gpu_cbv_copy()
+        && let Some(cbv_gpu) = list.cbv_copy(&shadow.buffer, shadow.offset(address), len)
+    {
+        shadow.refresh(list, address, len);
+        return Some(cbv_gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -2108,7 +2114,26 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let len = u64::from(size);
+                        if let Some(shadow) = crate::shadow::find(address, len.max(1))
+                            && len <= shadow.left(address)
+                        {
+                            let gpu = shadow.gpu(address);
+                            if gpu % 256 == 0 {
+                                shadow.refresh(list, address, len);
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                            if crate::host::gpu_cbv_copy()
+                                && let Some(cbv_gpu) =
+                                    list.cbv_copy(&shadow.buffer, shadow.offset(address), len)
+                            {
+                                shadow.refresh(list, address, len);
+                                host.constant_at(index, cbv_gpu, size);
+                                continue;
+                            }
+                        }
+                        let Some((gpu, to)) = list.scratch(len) else {
                             host.make_null(index);
                             continue;
                         };
