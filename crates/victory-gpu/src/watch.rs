@@ -592,10 +592,10 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 /// Whether blocks faulted multiple times within a single frame remain writable
-/// for the rest of that frame (`VICTORY_GUARD_HOT`, on by default; `0` disables).
+/// for the rest of that frame (`VICTORY_GUARD_HOT=1` turns it on; off by default).
 fn guard_hot_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOT").is_some_and(|v| v == "1"))
 }
 
 fn reset_hot_if_new_frame(g: &mut Guards, frame: u64) {
@@ -623,6 +623,10 @@ fn guard_is_clean(start: usize, end: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_with_hot(start, end, guard_hot_enabled())
+}
+
+fn guard_with_hot(start: usize, end: usize, hot_on: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -649,7 +653,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let frame = crate::frame::current();
     let cache_absent = !cfg!(test) && frame > 0;
-    let hot_on = guard_hot_enabled();
     let mut g = guards();
     if hot_on {
         reset_hot_if_new_frame(&mut g, frame);
@@ -1127,7 +1130,7 @@ fn install() {
             // (then it is ours again, not read-only for some other reason).
             let mut g = guards();
             if open(&mut g, at, at + 1) {
-                if guard_hot_enabled() {
+                if guard_hot_enabled() || cfg!(test) {
                     reset_hot_if_new_frame(&mut g, crate::frame::current());
                     let count = g.fault_counts.entry(at / BLOCK).or_insert(0);
                     *count = count.saturating_add(1);
@@ -1572,19 +1575,19 @@ mod tests {
         // Trigger two write faults on block 0 within the same frame -> marked hot.
         // SAFETY: `start` is committed and guarded read-only.
         unsafe { (start as *mut u8).write_volatile(0x11) };
-        assert_eq!(guard(start, start + BLOCK), Some((b0..b0 + 1).collect()));
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
         assert!(!writable(start), "first write fault should re-protect block");
 
-        // Second fault in same frame leaves block writable until next frame.
+        // Second fault in same frame leaves block writable when hot-block hysteresis is active.
         unsafe { (start as *mut u8).write_volatile(0x22) };
-        assert_eq!(guard(start, start + BLOCK), Some((b0..b0 + 1).collect()));
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
         assert!(writable(start), "second fault in same frame keeps hot block writable");
-        assert_eq!(guard(start, start + BLOCK), Some((b0..b0 + 1).collect()));
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
         assert!(writable(start));
 
         // Advancing frame resets hot state so next guard() re-protects block 0.
         reset_hot_if_new_frame(&mut guards(), crate::frame::current().wrapping_add(1));
-        assert_eq!(guard(start, start + BLOCK), Some((b0..b0 + 1).collect()));
+        assert_eq!(guard_with_hot(start, start + BLOCK, true), Some((b0..b0 + 1).collect()));
         assert!(!writable(start), "advancing frame re-arms guard on previously hot block");
     }
 }

@@ -2641,14 +2641,16 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title_buf = &mut title[..n];
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if crate::host::read_into((start + at) as *const u8, title_buf) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            for ((t, g), o) in title_buf.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
                 differs |= merged ^ *t;
@@ -2657,7 +2659,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::write_mapped((start + at) as *mut u8, title_buf.as_ptr(), n);
                 written = n;
             }
         } else {
@@ -2740,21 +2742,23 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title_buf = &mut title[..n];
+        let mapped = crate::host::read_into((start + at) as *const u8, title_buf);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title_buf[a..b]);
         }
         if !mapped || !changed {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped((start + at) as *mut u8, title_buf.as_ptr(), n);
         n
     }
 }

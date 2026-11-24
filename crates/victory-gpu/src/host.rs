@@ -3319,8 +3319,9 @@ impl Host {
                 (|| -> windows::core::Result<Option<ID3D12CommandList>> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    let mut compute_bound = false;
+                    let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
                     let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut to_hash: Vec<(&Arc<crate::shadow::Shadow>, &Vec<(usize, usize)>, ID3D12Resource, u64)> = Vec::new();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3331,56 +3332,53 @@ impl Host {
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let has_writes = !ranges.is_empty();
-                        let Some(before) = before else {
+                        if let Some(before) = before {
                             if has_writes {
-                                post_barriers.push(transition(
+                                pre_barriers.push(transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                                post_barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                     D3D12_RESOURCE_STATE_COMMON,
                                 ));
                             }
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if has_writes {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                            to_hash.push((shadow, ranges, before, size));
+                        } else if has_writes {
                             post_barriers.push(transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_COMMON,
                             ));
                         }
-                        if !compute_bound {
-                            list.SetComputeRootSignature(&work.root);
-                            list.SetPipelineState(&work.pso);
-                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                            compute_bound = true;
-                        }
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            if run.pieces > 0 {
-                                let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                                list.Dispatch(run.pieces, 1, 1);
+                    }
+                    if !pre_barriers.is_empty() {
+                        list.ResourceBarrier(&pre_barriers);
+                    }
+                    if !to_hash.is_empty() {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        for (shadow, ranges, before, size) in to_hash {
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
+                            // The same pieces in fewer passes (`rehash_runs`).
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                if run.pieces > 0 {
+                                    let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
+                                    list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                    list.Dispatch(run.pieces, 1, 1);
+                                }
                             }
                         }
                     }
