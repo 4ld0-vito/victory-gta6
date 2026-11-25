@@ -32,6 +32,27 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// For `victory precompile`: makes the host device (the translation depends on
+/// its wave width and view-heap cap, as in a run) and says whether there is one.
+pub fn precompile_init() -> bool {
+    let made = crate::host::host().is_some();
+    if made {
+        crate::descriptor::host::probe_view_limit();
+    }
+    made
+}
+
+/// For `victory precompile`: the translation of a console shader container
+/// put in the cache (or found there), as a run's first use of it would.
+pub fn precompile(container: &[u8]) -> Result<(), String> {
+    host_shader(container).map(|_| ())
+}
+
+/// Shaders found in the cache and translated since the start (hits, misses).
+pub fn precompile_counts() -> (u64, u64) {
+    counts()
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
