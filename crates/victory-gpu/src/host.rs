@@ -958,9 +958,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local rotating scratch pools for clamped indirect arguments
+    /// (`indirect`), split between direct (one-off) and multi-draw windows.
+    indirect_pool: Mutex<IndirectPool>,
     /// Device-local scratch buffers for 256-byte aligned CBV copies on the GPU.
     cbv_scratch: Mutex<CbvScratch>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -973,6 +973,31 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// `VICTORY_INDIRECT_POOL=0`: revert to a single indirect scratch buffer
+/// returned to `COMMON` after every execution (`indirect::done`).
+pub(crate) fn indirect_pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_POOL").is_none_or(|v| v != "0"))
+}
+
+const DIRECT_INDIRECT_SLOTS: usize = 8;
+const WINDOW_INDIRECT_SLOTS: usize = 16;
+
+#[derive(Default)]
+struct IndirectSlot {
+    buffer: Option<ID3D12Resource>,
+    cap: u64,
+    in_indirect: bool,
+}
+
+#[derive(Default)]
+struct IndirectPool {
+    direct: Vec<IndirectSlot>,
+    direct_next: usize,
+    windows: Vec<IndirectSlot>,
+    window_next: usize,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3112,7 +3137,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
+                indirect_pool: Mutex::default(),
                 cbv_scratch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -4941,6 +4966,17 @@ impl HostList {
                 c.3 = false;
             }
         }
+        {
+            let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.direct_next = 0;
+            pool.window_next = 0;
+            for slot in &mut pool.direct {
+                slot.in_indirect = false;
+            }
+            for slot in &mut pool.windows {
+                slot.in_indirect = false;
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -5527,31 +5563,59 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// A device-local unordered-access buffer of at least `size` bytes from
+    /// the list's rotating indirect scratch pool (`windowed` uses the
+    /// multi-draw ring, otherwise the direct ring). Returns `(buffer,
+    /// prev_in_indirect, slot_index)` so callers reusing a slot within the
+    /// same list transition from `INDIRECT_ARGUMENT`.
+    pub(crate) fn indirect_scratch_slot(
+        &self,
+        size: u64,
+        windowed: bool,
+    ) -> Option<(ID3D12Resource, bool, usize)> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
+        let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pooled = indirect_pool_enabled();
+        let (slots, next) = if pooled && windowed {
+            if pool.windows.is_empty() {
+                pool.windows
+                    .resize_with(WINDOW_INDIRECT_SLOTS, IndirectSlot::default);
+            }
+            let idx = pool.window_next % WINDOW_INDIRECT_SLOTS;
+            pool.window_next = (idx + 1) % WINDOW_INDIRECT_SLOTS;
+            (&mut pool.windows, idx)
+        } else {
+            let count = if pooled { DIRECT_INDIRECT_SLOTS } else { 1 };
+            if pool.direct.is_empty() {
+                pool.direct.resize_with(count, IndirectSlot::default);
+            }
+            let idx = pool.direct_next % count;
+            pool.direct_next = (idx + 1) % count;
+            (&mut pool.direct, idx)
+        };
+        let slot = &mut slots[next];
+        if let Some(buffer) = &slot.buffer
+            && slot.cap >= needed
         {
-            return Some(buffer.clone());
+            let prev_in_indirect = pooled && slot.in_indirect;
+            slot.in_indirect = pooled;
+            return Some((buffer.clone(), prev_in_indirect, next));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.cap;
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
-        if let Some((old_buf, _)) = old {
+        let old = slot.buffer.replace(buffer.clone());
+        slot.cap = alloc;
+        slot.in_indirect = pooled;
+        drop(pool);
+        if let Some(old_buf) = old {
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, false, next))
     }
 
     /// Keeps `object` alive until the list is reset.
