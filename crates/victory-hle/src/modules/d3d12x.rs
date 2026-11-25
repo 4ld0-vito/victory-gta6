@@ -52,6 +52,10 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
+/// For `victory precompile` (see `victory_gpu::shader_cache`).
+#[cfg(windows)]
+pub use victory_gpu::shader_cache::{precompile, precompile_counts, precompile_init};
+
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
