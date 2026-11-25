@@ -4777,11 +4777,17 @@ impl Host {
     }
 }
 
-/// Whether unaligned constant buffer views copy on the GPU (`VICTORY_GPU_CBV_COPY`,
-/// on by default; `0` falls back to CPU `defer_fill`).
+/// Whether unaligned constant buffer views copy on the GPU (`VICTORY_GPU_CBV_COPY=1`;
+/// off by default: the CPU fills them into upload memory, `defer_fill`).
+///
+/// Each GPU copy turns its scratch chunk from constant buffer back to copy
+/// destination and back, and that transition waits for every draw before it
+/// that read the chunk: in the gameplay scene the card ran 23-30 ms a frame
+/// longer with it (speed66 3.8 fps against speed67 5.4 fps, same build,
+/// shaders precompiled), and the CPU fill cost no more preparing time.
 pub(crate) fn gpu_cbv_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CBV_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CBV_COPY").is_some_and(|v| v == "1"))
 }
 
 #[derive(Default)]
