@@ -95,8 +95,19 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Waiting allowed per title frame, over all threads: 500 ms, or
+/// `VICTORY_PIPELINE_BUDGET_MS`. Past loading, every frame that meets new
+/// pipelines spends the whole budget waiting (0.5-2 fps stretches in runs
+/// speed23/24 while only 5-100 pipelines were being made).
+fn budget() -> Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500)
+    }))
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -164,7 +175,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = BUDGET.saturating_sub(spent.1);
+        let left = budget().saturating_sub(spent.1);
         if shared {
             spent.1 += left;
         }

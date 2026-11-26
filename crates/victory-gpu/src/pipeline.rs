@@ -296,6 +296,12 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        #[cfg(feature = "diagnostics")]
+        for p in &b.pipelines {
+            if let Some(why) = make::missing(p) {
+                tracing::warn!(why, "a ray-tracing structure builder program without a host pipeline");
+            }
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -308,6 +314,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    crate::writetrace::arm();
     true
 }
 

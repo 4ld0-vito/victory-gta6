@@ -83,6 +83,26 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The copy the directory gives the page of `address`, if it holds all of
+/// `root` from `address` on: a shader that reads title memory by address
+/// must reach a root view's bytes through the same copy, or a stage that
+/// stores through the one and a later stage of the same submission that
+/// reads through the other sees stale bytes (the structure builder's 7 KiB
+/// header buffer inside a 4 MiB window: its stages then computed offsets
+/// from old bytes and stored bounds over the title's own objects).
+pub(crate) fn copy_for_view(address: u64, root: &Arc<Shadow>) -> Option<Arc<Shadow>> {
+    let page = address / PAGE;
+    if address == 0 || page >= u64::from(MEMORY_PAGES) - 1 {
+        return None;
+    }
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    // SAFETY: inside the directory's mapping.
+    let n = unsafe { m.directory.1.add(page as usize * 2).read() };
+    let copy = m.copies.get((n as usize).checked_sub(1)?)?;
+    (copy.offset_in(address).is_some() && copy.left(address) >= root.left(address)).then(|| copy.clone())
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -157,6 +177,10 @@ impl Memory {
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                {
+                    let (s0, l0) = shadow.span();
+                    tracing::debug!(n = n + 1, start = format_args!("{s0:#x}"), len = format_args!("{l0:#x}"), asked = format_args!("{start:#x}"), "title memory by address: a copy numbered");
+                }
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that

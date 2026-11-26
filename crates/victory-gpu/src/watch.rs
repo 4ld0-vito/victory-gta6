@@ -49,6 +49,10 @@ struct Journal {
     kept: bool,
 }
 
+/// Taken around a guarding and its noting in [`JOURNAL`] (always before the
+/// journal's lock, never inside it).
+static GUARD_ORDER: Mutex<()> = Mutex::new(());
+
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
@@ -349,13 +353,20 @@ pub(crate) fn writes_ex(
                 ));
             }
         }
-        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        // Guarding (VirtualQuery/VirtualProtect) happens outside the
+        // journal's lock, so other threads answering from the journal do not
+        // wait for it; `GUARD_ORDER` keeps guard-then-note in one order, so
+        // pages one guarding found are in the journal before any later
+        // guarding returns.
+        let order = GUARD_ORDER.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(a, b);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         let guarded_pages = written?;
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        drop(order);
         j.asked += 1;
         let now = j.asked;
         for page in guarded_pages {
@@ -367,8 +378,8 @@ pub(crate) fn writes_ex(
             true,
         ));
     }
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut journal = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *journal;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -393,20 +404,37 @@ pub(crate) fn writes_ex(
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
+    if failed {
         if !guarded {
             return None;
         }
+        // Not write-watched: a view, guarded outside the journal's lock
+        // (see the guarded branch above for the order).
+        drop(journal);
+        let order = GUARD_ORDER.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
-    } else {
-        Vec::new()
-    };
+        let guarded_pages = written?;
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        drop(order);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            slow(started.elapsed().as_micros() as u64);
+        }
+        j.asked += 1;
+        let now = j.asked;
+        for page in guarded_pages {
+            j.written.insert(page, now);
+        }
+        return Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(), true));
+    }
+    let guarded: Vec<usize> = Vec::new();
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};

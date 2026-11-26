@@ -251,8 +251,45 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, prev_in_indirect, _) = list.indirect_scratch_slot(bytes, false)?;
+    record_clamp_as(
+        c,
+        &list.list,
+        &dst,
+        budget,
+        src,
+        count,
+        spec,
+        false,
+        prev_in_indirect,
+    )
+    .then_some(dst)
+}
+
+/// As [`bound`], using a rotating slot in the list's window scratch ring and
+/// returning both the scratch buffer and its ring slot index.
+pub(crate) fn bound_window_slot(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, usize)> {
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, prev_in_indirect, slot) = list.indirect_scratch_slot(bytes, true)?;
+    record_clamp_as(
+        c,
+        &list.list,
+        &dst,
+        budget,
+        src,
+        None,
+        spec,
+        ahead,
+        prev_in_indirect,
+    )
+    .then_some((dst, slot))
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -265,16 +302,16 @@ pub(crate) fn bound(
 /// 4294967295", 43 to 153 such records a frame). Here a record that asks
 /// for more than can run is left empty and charges nothing; a record
 /// clamped alone is clamped and charged as before.
+#[allow(dead_code)]
 pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    bound_window_slot(list, src, spec, true).map(|(dst, _)| dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,11 +321,12 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead`]). `prev_in_indirect`: the scratch slot was
+/// already left in `INDIRECT_ARGUMENT` by an earlier clamp on this list.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -299,6 +337,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    prev_in_indirect: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -356,13 +395,14 @@ fn record_clamp_as(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
+    let before = if prev_in_indirect {
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+    } else {
+        D3D12_RESOURCE_STATE_COMMON
+    };
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [transition(
         dst,
@@ -389,8 +429,13 @@ fn record_clamp_as(
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
+/// when using the rotating scratch pool, the slot stays in
+/// `INDIRECT_ARGUMENT` until reused or list reset; under
+/// `VICTORY_INDIRECT_POOL=0` returns the scratch buffer to `COMMON`.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if crate::host::indirect_pool_enabled() {
+        return;
+    }
     done_on(&list.list, scratch);
 }
 
@@ -1001,6 +1046,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                false,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1149,8 +1195,8 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
-    /// and `HostList::reset` end-to-end on the host device.
+    /// Exercises `HostList::indirect_scratch_slot`, rotating pool wrap,
+    /// growth, `Host::execute`, and `HostList::reset` on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
         let Some(host) = super::host() else {
@@ -1171,24 +1217,25 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
-        // First two calls fit inside the initial 64 KiB scratch buffer and
-        // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
+        // Fill the 8 direct ring slots; slot 8 must wrap back to slot 0 and
+        // reuse the exact same `ID3D12Resource`.
+        let b0 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        for _ in 2..8 {
+            let _ = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        }
+        let b8 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         assert_eq!(
-            b1.as_raw(),
-            b2.as_raw(),
-            "scratch buffer within capacity must be reused"
+            b0.as_raw(),
+            b8.as_raw(),
+            "rotating direct slot 0 must be reused on wrap"
         );
 
-        // A call needing >64 KiB grows the scratch buffer mid-list while keeping
-        // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
+        // Next call targets slot 1 and needs >64 KiB, growing slot 1 while
+        // keeping `b1` alive until reset.
+        let b_grown = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         assert_ne!(
-            b3.as_raw(),
+            b_grown.as_raw(),
             b1.as_raw(),
             "larger request must grow scratch buffer"
         );
@@ -1197,17 +1244,109 @@ void main() {
         host.execute(&[&list]);
         list.reset();
 
-        // After reset, requests up to the grown high-water mark reuse `b3` with
-        // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
+        // After reset, ring resets to slot 0 (`b0`), then slot 1 (`b_grown`).
+        let r0 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let r1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
-            "grown scratch buffer must persist across reset"
+            r0.as_raw(),
+            b0.as_raw(),
+            "slot 0 must reuse its buffer across reset"
+        );
+        assert_eq!(
+            r1.as_raw(),
+            b_grown.as_raw(),
+            "grown slot 1 buffer must persist across reset"
         );
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Exercises `prev_in_indirect` state tracking across repeated clamps on
+    /// the same scratch buffer within a command list and after reset on WARP.
+    #[test]
+    fn warp_rotating_indirect_scratch_and_state_transitions() {
+        let Some(h) = WarpHarness::new() else {
+            return;
+        };
+        let mut h = h;
+        let (src, src_ptr, _) = h.shared_buffer(64);
+        let (hits, hits_ptr, hits_gpu) = h.shared_buffer(16);
+        let (_, _, budget_gpu) = h.shared_buffer(16);
+        let dst = h.default_uav(64 << 10);
+        let sig = h.signature(2, 12);
+        // SAFETY: mapped host buffers.
+        unsafe {
+            let words = src_ptr.cast::<u32>();
+            for (i, w) in [1u32, 1, 1].into_iter().enumerate() {
+                words.add(i).write_volatile(w);
+            }
+            hits_ptr.cast::<u32>().write_volatile(0);
+        }
+
+        // First clamp in the list transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+        assert!(record_clamp_as(
+            &h.clamp,
+            &h.list,
+            &dst,
+            budget_gpu,
+            (&src, 0),
+            None,
+            (2, 12, 1),
+            false,
+            false,
+        ));
+        // SAFETY: live compute pipeline and indirect argument buffer in INDIRECT_ARGUMENT.
+        unsafe {
+            h.list.SetComputeRootSignature(&h.worker.root);
+            h.list.SetPipelineState(&h.worker.pso);
+            h.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            h.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+        }
+
+        // Reusing `dst` in the same list transitions `INDIRECT_ARGUMENT -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+        assert!(record_clamp_as(
+            &h.clamp,
+            &h.list,
+            &dst,
+            budget_gpu,
+            (&src, 0),
+            None,
+            (2, 12, 1),
+            false,
+            true,
+        ));
+        unsafe {
+            h.list.SetComputeRootSignature(&h.worker.root);
+            h.list.SetPipelineState(&h.worker.pso);
+            h.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            h.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+        }
+        h.submit_and_wait();
+
+        // After reset, D3D12 decays buffers back to `COMMON` -> `prev_in_indirect = false`.
+        assert!(record_clamp_as(
+            &h.clamp,
+            &h.list,
+            &dst,
+            budget_gpu,
+            (&src, 0),
+            None,
+            (2, 12, 1),
+            false,
+            false,
+        ));
+        unsafe {
+            h.list.SetComputeRootSignature(&h.worker.root);
+            h.list.SetPipelineState(&h.worker.pso);
+            h.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            h.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+        }
+        h.submit_and_wait();
+
+        // SAFETY: GPU completed; readback host-mapped hits counter.
+        let total = unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(total, 3);
+        drop(hits);
     }
 }

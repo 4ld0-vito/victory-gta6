@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -81,6 +82,15 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Translate every shader container found (files or folders, recursively)
+    /// into the shader cache a run uses, so that a run finds them translated.
+    /// The cache is per build of this executable.
+    Precompile {
+        paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -163,6 +173,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Precompile { paths, jobs } => precompile::run(paths, jobs),
         Command::Run {
             exe,
             unimplemented,

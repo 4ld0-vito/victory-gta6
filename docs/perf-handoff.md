@@ -4,6 +4,46 @@
 
 ---
 
+## 0. Latest status (2026-11-25, Claude Code session, branch `perf/phase-8-indirect-gpu-sync`)
+
+**Read this first; sections 1-6 below are the earlier (Phase 7b) picture.**
+
+### What changed
+| Commit | Change | Effect |
+|---|---|---|
+| `81c77c3` | `watch.rs`: guard outside `JOURNAL.write()` with a `GUARD_ORDER` mutex (keeps guard-then-note ordered); `Deferred::gpu_writes` side list | neutral (A/B) |
+| `25dacda` | `VICTORY_PIPELINE_BUDGET_MS` (default 500): per-frame wait for pipelines still being made | **heavy scene 1.0-1.7 fps -> 4-6 fps** with `=8`; the title stood idle 400-1,700 ms/frame waiting for new pipelines |
+| `b64e8f0` | translator: optimistic `lane_uniform` (+ `tid.x >> 6`, LDS reads at such addresses), constant lane masks in local waves, `VICTORY_HOST_WAVE` for offline `translate` | all 53 ray-tracing builder programs translate exactly on wave32 |
+| `b7a8c4e` | root views of by-address shaders take the memory directory's copy (`VICTORY_BVH_VIEWS_DIRECTORY=0` reverts) | real bug fix for the builder |
+| `166060e` | diagnostics: `VICTORY_BACK_CONFLICTS`, `VICTORY_BACK_TITLE_WINS`, `VICTORY_WRITE_TRACE` | off by default |
+| `b2804b2` | GPU test harness `Root::Uav`; `emit/builder_tests.rs` (needs `VICTORY_BVH_DLL`) | builder prefix sums bit-exact |
+| `f895202` | indirect windows survive draws that cannot store (`VICTORY_WINDOW_KEEP=0` reverts) | clamps 2.4-3.0k -> 2.3k/frame, fps within noise |
+
+**Preset:** add `VICTORY_PIPELINE_BUDGET_MS=8` to the benchmark preset (already in the workspace `AGENTS.md`).
+
+### Current bottleneck (heavy gameplay scene, 5-8k draws/frame, ~5 fps, 0 errors, ~23 GB peak)
+- **The GPU is 80-90% busy** (`the card's clock per frame`). Frame ~200 ms = preparing 70-90 + GPU 90-130 + copying back 40-55 (partly overlapped).
+- `VICTORY_GPU_TIMING=1` (diag): of ~120 ms of command time per frame, **indirect commands 92 ms in ~4,160 commands**, dispatch 17 ms, mesh 7 ms. Top: two depth-only mesh pipelines (~16 + 14 ms in ~420 + ~290 commands); ~25-40 us per indirect command for ~125 groups each.
+- 380-740k indirect mesh groups/frame (legitimate counts, max 65,535).
+
+### Verified dead ends this session (do not repeat)
+- Display resolution (1080p vs default 4K): GPU time unchanged (`speed46`).
+- Removing the indirect clamp's global UAV barrier (`VICTORY_BARRIER_TEST=indirect`, diag): no gain (`speed49`).
+- Emptying mesh records asking >= 65,535 groups: no gain (`speed50`).
+- Capping mesh outputs to 64 (instead of the fixed 128/128 `SetMeshOutputCounts`): no GPU-time change (`speed53`) -> output count is not the cost.
+- Benchmarks: always A/B in the same session; a new exe means a cold shader cache (keyed by exe hash) -> measure the 2nd run. Runs with `dstorage: a destination's physical pages could not be written` warnings, or that stall in menus, are not comparable.
+
+### Next steps for fps (ordered)
+1. **Find why each indirect mesh command costs ~25-40 us.** Suspects: compute<->graphics switching around each per-record clamp (still ~2,300 single-record clamps/frame), the single shared `indirect_scratch` buffer serialising consecutive draws (Phase 8 item 2: rotating scratch slots), `mesh_scissor` state changes per command, and root-signature/pipeline rebinds after each clamp (`host_pipeline = 0; host_roots[1] = 0`). Try: clamp **all** records of a list's argument buffers in one pass at the start of the list (or per barrier group) so no compute runs between mesh draws; measure with `VICTORY_GPU_TIMING=1`.
+2. Then CPU side: preparing 70-90 ms (copies ~45 ms / 110-150 MB, refresh page faults) and copying back 40-55 ms.
+
+### Ray tracing (`VICTORY_BVH_BUILDER=1`) - off; title crashes ~20 s after the builder starts
+- Faults in the title's deferred-release list (`title+0x4f38ba5`) on objects holding box-node bounds (fp16/fp32 infinities). Ruled out: relay, card buffers, perf switches, lost by-address accesses, our copy-back (`VICTORY_WRITE_TRACE=1`: no write of ours near the faulting objects), the builder's prefix sums (unit test). Quarantine crashes the same way.
+- Likely: 21 compute programs still dropped every frame (8x "lane mask holding lanes elsewhere read as data", wave ops where not every lane runs, `v_cvt_f32_f64`, `v_permlanex16_b32`, and 5 pipelines refused because they stay wave64: "an LDS read and write in one lane-branch region"). Reproduce offline: run once with `VICTORY_SHADER_SAVE=<local dir>`, then `VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1 victory.exe translate --list --pipelines <dir>`.
+- TTD + WinDbg are installed on the machine (winget); recording needs an elevated shell and `ttd.exe -accepteula` once.
+
+---
+
 ## 1. Benchmark Progression
 
 | Run / Branch | Profile / Key Flags | World FPS (heavy / peak) | Peak RAM | Notes / Findings |

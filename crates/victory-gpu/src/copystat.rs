@@ -127,8 +127,16 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Indirect window cache hits and misses by cause.
+    IndirectWindowHit,
+    IndirectMissDispatch,
+    IndirectMissMax,
+    IndirectMissCount,
+    IndirectMissStores,
+    IndirectMissFirst,
+    IndirectMissJump,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1241,6 +1249,23 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    let miss_total = c[C::IndirectMissDispatch as usize]
+        + c[C::IndirectMissMax as usize]
+        + c[C::IndirectMissCount as usize]
+        + c[C::IndirectMissStores as usize]
+        + c[C::IndirectMissFirst as usize]
+        + c[C::IndirectMissJump as usize];
+    tracing::info!(
+        "  indirect windows: {:.0} hits, {:.0} misses (dispatch {:.0}, max>1 {:.0}, count {:.0}, stores {:.0}, first {:.0}, jump {:.0})",
+        c[C::IndirectWindowHit as usize],
+        miss_total,
+        c[C::IndirectMissDispatch as usize],
+        c[C::IndirectMissMax as usize],
+        c[C::IndirectMissCount as usize],
+        c[C::IndirectMissStores as usize],
+        c[C::IndirectMissFirst as usize],
+        c[C::IndirectMissJump as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

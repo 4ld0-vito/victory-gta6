@@ -958,9 +958,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local rotating scratch pools for clamped indirect arguments
+    /// (`indirect`), split between direct (one-off) and multi-draw windows.
+    indirect_pool: Mutex<IndirectPool>,
     /// Device-local scratch buffers for 256-byte aligned CBV copies on the GPU.
     cbv_scratch: Mutex<CbvScratch>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -973,6 +973,31 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// `VICTORY_INDIRECT_POOL=0`: revert to a single indirect scratch buffer
+/// returned to `COMMON` after every execution (`indirect::done`).
+pub(crate) fn indirect_pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_POOL").is_none_or(|v| v != "0"))
+}
+
+const DIRECT_INDIRECT_SLOTS: usize = 8;
+const WINDOW_INDIRECT_SLOTS: usize = 16;
+
+#[derive(Default)]
+struct IndirectSlot {
+    buffer: Option<ID3D12Resource>,
+    cap: u64,
+    in_indirect: bool,
+}
+
+#[derive(Default)]
+struct IndirectPool {
+    direct: Vec<IndirectSlot>,
+    direct_next: usize,
+    windows: Vec<IndirectSlot>,
+    window_next: usize,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1844,6 +1869,10 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// The `Step::GpuWrite`s of `copies` again (host copy, address, bytes),
+    /// so `declared_writes` and `card_before` need not walk the thousands
+    /// of refreshes a world list holds to find them.
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Deferred {
@@ -1862,9 +1891,12 @@ impl Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.copies.clear();
-        if self.copies.capacity() > 4096 {
-            self.copies.shrink_to(1024);
+        // World lists hold 10-20k steps each frame: shrinking below that
+        // only made every frame grow them again.
+        if self.copies.capacity() > 65536 {
+            self.copies.shrink_to(16384);
         }
+        self.gpu_writes.clear();
         self.uploads.clear();
         self.upload_bytes = 0;
         self.kept.clear();
@@ -2887,8 +2919,8 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+        for (shadow, address, len) in &list.deferred().gpu_writes {
+            {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -3105,7 +3137,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
+                indirect_pool: Mutex::default(),
                 cbv_scratch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -3252,10 +3284,8 @@ impl Host {
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
+            for (shadow, address, len) in &list.deferred().gpu_writes {
+                if shadow.carded() {
                     let range = (*address, *address + *len);
                     match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                         Some((_, ranges)) => {
@@ -4747,11 +4777,17 @@ impl Host {
     }
 }
 
-/// Whether unaligned constant buffer views copy on the GPU (`VICTORY_GPU_CBV_COPY`,
-/// on by default; `0` falls back to CPU `defer_fill`).
+/// Whether unaligned constant buffer views copy on the GPU (`VICTORY_GPU_CBV_COPY=1`;
+/// off by default: the CPU fills them into upload memory, `defer_fill`).
+///
+/// Each GPU copy turns its scratch chunk from constant buffer back to copy
+/// destination and back, and that transition waits for every draw before it
+/// that read the chunk: in the gameplay scene the card ran 23-30 ms a frame
+/// longer with it (speed66 3.8 fps against speed67 5.4 fps, same build,
+/// shaders precompiled), and the CPU fill cost no more preparing time.
 pub(crate) fn gpu_cbv_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CBV_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CBV_COPY").is_some_and(|v| v == "1"))
 }
 
 #[derive(Default)]
@@ -4934,6 +4970,17 @@ impl HostList {
             }
             for c in &mut cbv.chunks {
                 c.3 = false;
+            }
+        }
+        {
+            let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.direct_next = 0;
+            pool.window_next = 0;
+            for slot in &mut pool.direct {
+                slot.in_indirect = false;
+            }
+            for slot in &mut pool.windows {
+                slot.in_indirect = false;
             }
         }
         // SAFETY: the list is not executing.
@@ -5419,9 +5466,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        deferred.gpu_writes.push((shadow.clone(), address, len));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5522,31 +5569,59 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// A device-local unordered-access buffer of at least `size` bytes from
+    /// the list's rotating indirect scratch pool (`windowed` uses the
+    /// multi-draw ring, otherwise the direct ring). Returns `(buffer,
+    /// prev_in_indirect, slot_index)` so callers reusing a slot within the
+    /// same list transition from `INDIRECT_ARGUMENT`.
+    pub(crate) fn indirect_scratch_slot(
+        &self,
+        size: u64,
+        windowed: bool,
+    ) -> Option<(ID3D12Resource, bool, usize)> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
+        let mut pool = self.indirect_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let pooled = indirect_pool_enabled();
+        let (slots, next) = if pooled && windowed {
+            if pool.windows.is_empty() {
+                pool.windows
+                    .resize_with(WINDOW_INDIRECT_SLOTS, IndirectSlot::default);
+            }
+            let idx = pool.window_next % WINDOW_INDIRECT_SLOTS;
+            pool.window_next = (idx + 1) % WINDOW_INDIRECT_SLOTS;
+            (&mut pool.windows, idx)
+        } else {
+            let count = if pooled { DIRECT_INDIRECT_SLOTS } else { 1 };
+            if pool.direct.is_empty() {
+                pool.direct.resize_with(count, IndirectSlot::default);
+            }
+            let idx = pool.direct_next % count;
+            pool.direct_next = (idx + 1) % count;
+            (&mut pool.direct, idx)
+        };
+        let slot = &mut slots[next];
+        if let Some(buffer) = &slot.buffer
+            && slot.cap >= needed
         {
-            return Some(buffer.clone());
+            let prev_in_indirect = pooled && slot.in_indirect;
+            slot.in_indirect = pooled;
+            return Some((buffer.clone(), prev_in_indirect, next));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.cap;
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
-        if let Some((old_buf, _)) = old {
+        let old = slot.buffer.replace(buffer.clone());
+        slot.cap = alloc;
+        slot.in_indirect = pooled;
+        drop(pool);
+        if let Some(old_buf) = old {
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, false, next))
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -5979,6 +6054,7 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    crate::writetrace::note(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let user_copy = safe_copy_enabled();
